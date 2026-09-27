@@ -1,0 +1,27 @@
+{
+  "name": "opencode-usage",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin exposing OpenCode Go, Codex and Cursor account quota status with reset times.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=23.6.0"
+  },
+  "main": "./index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./rpc": "./src/rpc.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest",
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "typescript": "^5"
+  }
+}
