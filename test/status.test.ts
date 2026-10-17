@@ -146,11 +146,12 @@ describe("StatusEngine.read", () => {
   });
 });
 
-describe("StatusEngine reset gating", () => {
-  it("does not re-poll a capped window before its reset, and polls at the reset", async () => {
+describe("StatusEngine reset rechecks", () => {
+  it("rechecks a capped window after the TTL, before the reported reset", async () => {
     const clock = fakeClock();
     const { provider, calls } = scriptedProvider("go", [
       GO_CAPPED_ROLLING(T0, iso(T0 + 2 * HOUR)),
+      GO_CAPPED_ROLLING(T0 + 61_000, iso(T0 + 2 * HOUR)),
       GO_OK(T0 + 2 * HOUR),
     ]);
     const engine = new StatusEngine({ providers: { go: provider }, storage: memStorage().storage, now: clock.now });
@@ -158,13 +159,14 @@ describe("StatusEngine reset gating", () => {
     assert.equal(first.availability, "limited");
     assert.equal(calls.current, 1);
 
-    clock.set(T0 + 1 * HOUR); // TTL long past, reset not reached
-    await engine.read("go");
-    assert.equal(calls.current, 1, "gated: no upstream poll before the reset");
+    clock.set(T0 + 61_000); // TTL expired, reported reset still in the future
+    const early = await engine.read("go");
+    assert.equal(calls.current, 2, "rechecks before the reported reset");
+    assert.equal(early.availability, "limited");
 
     clock.set(T0 + 2 * HOUR + 1_000); // just past the reset
     const after = await engine.read("go");
-    assert.equal(calls.current, 2, "re-fetches before claiming availability");
+    assert.equal(calls.current, 3, "re-fetches when the cap lifts");
     assert.equal(after.availability, "available");
   });
 
@@ -201,31 +203,30 @@ describe("StatusEngine reset gating", () => {
 
   it("a paid pool never reads available while any shared cap window is active", async () => {
     const clock = fakeClock();
-    const { provider } = scriptedProvider("go", [GO_CAPPED_ROLLING(T0, iso(T0 + 2 * HOUR))]);
+    const { provider } = scriptedProvider("go", [
+      GO_CAPPED_ROLLING(T0, iso(T0 + 2 * HOUR)),
+      GO_CAPPED_ROLLING(T0 + 60_000, iso(T0 + 2 * HOUR)),
+    ]);
     const engine = new StatusEngine({ providers: { go: provider }, storage: memStorage().storage, now: clock.now });
     await engine.read("go");
-    clock.set(T0 + 60_000); // TTL expired, still inside the gate
+    clock.set(T0 + 60_000); // TTL expired; the recheck is still capped
     const served = await engine.read("go");
     assert.notEqual(served.availability, "available");
   });
 
-  it("uses a bounded backoff (never permanent denial) when a capped window has no reset", async () => {
+  it("rechecks a capped window that has no reset timestamp after the TTL", async () => {
     const clock = fakeClock();
     const { provider, calls } = scriptedProvider("go", [
-      GO_CAPPED_ROLLING(T0, null), // capped, no timestamp
-      GO_OK(T0 + 16 * MIN),
+      GO_CAPPED_ROLLING(T0, null),
+      GO_OK(T0 + 61_000),
     ]);
     const engine = new StatusEngine({ providers: { go: provider }, storage: memStorage().storage, now: clock.now });
     await engine.read("go");
     assert.equal(calls.current, 1);
 
-    clock.set(T0 + 10 * MIN); // inside the default 15-minute backoff
-    await engine.read("go");
-    assert.equal(calls.current, 1, "no poll inside the backoff window");
-
-    clock.set(T0 + 16 * MIN); // backoff expired
+    clock.set(T0 + 61_000);
     const after = await engine.read("go");
-    assert.equal(calls.current, 2, "bounded backoff ends — never a permanent denial");
+    assert.equal(calls.current, 2, "a missing reset does not freeze the source");
     assert.equal(after.availability, "available");
   });
 
@@ -277,23 +278,23 @@ describe("StatusEngine failures and stale data", () => {
     assert.equal(snap.sources.go.stale, true);
   });
 
-  it("refresh() forces an immediate read-only poll even while reset-gated (denial trigger)", async () => {
+  it("refresh() forces an immediate read-only poll inside the TTL (denial trigger)", async () => {
     const clock = fakeClock();
     const { provider, calls } = scriptedProvider("go", [
       GO_CAPPED_ROLLING(T0, iso(T0 + 2 * HOUR)),
-      GO_OK(T0 + 61_000),
+      GO_OK(T0 + 1_000),
     ]);
     const engine = new StatusEngine({ providers: { go: provider }, storage: memStorage().storage, now: clock.now });
     await engine.read("go");
     assert.equal(calls.current, 1);
 
-    clock.set(T0 + 61_000); // TTL expired but the 2h reset gate holds read()
+    clock.set(T0 + 1_000); // still inside the TTL
     const viaRead = await engine.read("go");
-    assert.equal(calls.current, 1, "read() stays gated");
+    assert.equal(calls.current, 1, "read() serves the fresh cache");
     assert.equal(viaRead.availability, "limited");
 
     const forced = await engine.refresh("go");
-    assert.equal(calls.current, 2, "denial trigger bypasses the reset gate");
+    assert.equal(calls.current, 2, "denial trigger bypasses the TTL");
     assert.equal(forced.availability, "available");
   });
 });

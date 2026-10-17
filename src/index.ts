@@ -5,8 +5,8 @@
 //   -> Go attribution (#8) -> RPC (#9) + status file (#10) -> one poll loop.
 //
 // Rules:
-// - The engine is the SINGLE owner of upstream polling (TTL, reset gates,
-//   in-flight coalescing). The wiring adds exactly one background interval:
+// - The engine is the SINGLE owner of upstream polling (TTL and in-flight
+//   coalescing). The wiring adds exactly one background interval:
 //   tick = engine.snapshot() + file publish. engine.start() is NOT used, so an
 //   upstream endpoint is never polled twice concurrently.
 // - Failure isolation: provider errors degrade to "unknown", publish errors

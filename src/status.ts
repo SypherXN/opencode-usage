@@ -7,16 +7,15 @@
 // Rules:
 // - A source's cache is fresh for ttlMs (~60s). N concurrent readers within
 //   the TTL coalesce into exactly one upstream fetch (in-flight promise).
-// - Reset gating: while any provider-reported window is rate-limited with a
-//   future resetsAt, no re-poll before the EARLIEST such reset (so a monthly
-//   cap still blocks after a 5h reset, and a reset re-fetches before claiming
-//   availability). A capped window with NO reset gets a bounded backoff —
-//   never a permanent denial.
+// - A rate-limited window does not suppress later polls. Provider reset times
+//   can arrive early, so the next TTL rechecks the usage endpoint instead of
+//   waiting for resetsAt. Availability still comes from the windows that poll
+//   returns, so a monthly cap stays limited after a 5h window clears.
 // - Auth/network failures keep the last timestamped windows, marked stale,
 //   with availability "unknown" — stale data never claims current availability
 //   or exhaustion.
 // - refresh() (quota-denial trigger) performs one immediate read-only usage
-//   poll, bypassing TTL and reset gates.
+//   poll, bypassing the TTL.
 // - The background loop polls read-only usage endpoints only. No inference
 //   probes, no model switching, no fallback resets.
 
@@ -44,9 +43,6 @@ const SOURCE_IDS: readonly SourceId[] = ["go", "codex", "cursor"];
 /** Durable key for the last snapshot (success or last-known on failure). */
 export const SNAPSHOT_KEY = "status/snapshot";
 
-/** Recheck delay when a capped window carries no usable reset timestamp. */
-const MISSING_RESET_BACKOFF_MS = 15 * 60_000;
-
 export interface StatusEngineOptions {
   /** Provider adapters. Missing sources are unconfigured (unknown, never polled). */
   providers?: Partial<Record<SourceId, QuotaSource>>;
@@ -58,8 +54,6 @@ export interface StatusEngineOptions {
   ttlMs?: number;
   /** One-time estimated Cursor reset date, superseded by provider or observed resets. */
   cursorResetAt?: string;
-  /** Backoff for capped windows without a reset. Default 15 minutes. */
-  missingResetBackoffMs?: number;
 }
 
 interface CacheEntry {
@@ -70,28 +64,6 @@ interface CacheEntry {
   verified: boolean;
   /** In-flight coalesced poll, if any. */
   inFlight?: Promise<SourceStatus>;
-}
-
-/**
- * Earliest ms at which the source may poll upstream again; null when not
- * gated. Gate = the earliest future reset among rate-limited windows; a
- * capped window without a reset contributes a bounded backoff instead.
- */
-function gateMs(status: SourceStatus, lastGoodMs: number | null, backoffMs: number): number | null {
-  const capped = status.windows.filter(
-    (w) => w.state === "rate-limited" && !("resetEstimated" in w && w.resetEstimated),
-  );
-  if (capped.length === 0) return null;
-  let earliest: number | null = null;
-  const consider = (t: number) => {
-    earliest = earliest === null ? t : Math.min(earliest, t);
-  };
-  for (const w of capped) {
-    const t = w.resetsAt !== null ? Date.parse(w.resetsAt) : Number.NaN;
-    if (Number.isFinite(t)) consider(t);
-    else consider((lastGoodMs ?? 0) + backoffMs); // bounded, never permanent
-  }
-  return earliest;
 }
 
 function nextMonthlyReset(nowMs: number, day: number): string {
@@ -143,7 +115,6 @@ export class StatusEngine {
   private readonly storage: StorageLike | null;
   private readonly now: () => number;
   private readonly ttlMs: number;
-  private readonly backoffMs: number;
   private readonly cursorResetAt?: string;
   private readonly entries: Record<SourceId, CacheEntry>;
   private estimator: (go: SourceStatus) => Record<string, GoModelEstimate> = () => ({});
@@ -154,7 +125,6 @@ export class StatusEngine {
     this.storage = opts.storage ?? null;
     this.now = opts.now ?? (() => Date.now());
     this.ttlMs = opts.ttlMs ?? POLL_CACHE_MS;
-    this.backoffMs = opts.missingResetBackoffMs ?? MISSING_RESET_BACKOFF_MS;
     this.cursorResetAt = opts.cursorResetAt;
     const entry = (id: SourceId): CacheEntry => ({
       status: this.providers[id]
@@ -192,7 +162,7 @@ export class StatusEngine {
 
   /**
    * Immediate safe read-only usage poll (quota-denial trigger). Bypasses the
-   * TTL and reset gates; still coalesces with any in-flight poll.
+   * TTL; still coalesces with any in-flight poll.
    */
   refresh(id: SourceId): Promise<SourceStatus> {
     return this.poll(id, true);
@@ -258,8 +228,6 @@ export class StatusEngine {
     const nowMs = this.now();
     const age = e.checkedAtMs === null ? Number.POSITIVE_INFINITY : nowMs - e.checkedAtMs;
     if (age < this.ttlMs) return false; // fresh — serve cache, no upstream call
-    const gate = gateMs(e.status, e.checkedAtMs, this.backoffMs);
-    if (gate !== null && nowMs < gate) return false; // reset-gated
     return true;
   }
 

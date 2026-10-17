@@ -80,7 +80,7 @@ From another plugin: `await ctx.rpc(USAGE_RPC).status({})`. OpenChamber agents/t
 ## Freshness and reset semantics
 
 - **~60 s poll cache** shared by every reader (RPC, file, other agents/tools). N concurrent reads coalesce into exactly one upstream fetch; a single background interval drives the loop.
-- **Reset gating:** provider-reported reset timestamps gate polling until the earliest reset; estimated reset timestamps do not gate polling, so usage changes can still be observed. A capped window without a usable reset rechecks after 15 minutes — never a permanent denial.
+- **Rechecks while capped:** a rate-limited window does not stop polling. The next cache interval rechecks the usage endpoint, so a reset that arrives before the reported `resetsAt` is observed. Availability still comes from the windows that poll returns, so a monthly cap stays limited after a shorter window clears.
 - **Cursor reset estimate:** the optional plugin setting `cursorResetAt` supplies a one-time estimated reset when Cursor omits one (for example, set it under the plugin entry's `options`). On a successful poll that observes usage drop from above 0% to exactly 0%, the plugin remembers that UTC day-of-month as `resetDay` and uses it for later monthly estimates. This is a coarse heuristic, not an official Cursor reset time; provider-reported `resetsAt` always wins.
 - Data older than 5 minutes is marked `stale: true` and its availability becomes `unknown` — stale data never claims current availability or exhaustion.
 - Auth/network failures keep the last-known windows and report `unknown` with a safe `error` (e.g. `authentication failed`, `usage API returned HTTP 500`).

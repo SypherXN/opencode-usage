@@ -321,7 +321,7 @@ describe("plugin wiring: credentialed status flow", () => {
 });
 
 describe("plugin wiring: denial and reset gating", () => {
-  it("a Go denial triggers one immediate refresh; the reset gate holds until the reset", async () => {
+  it("a Go denial triggers one immediate refresh; a later tick rechecks before the reset", async () => {
     const restoreEnv = scrubEnv();
     try {
       const dir = freshTmp();
@@ -349,10 +349,10 @@ describe("plugin wiring: denial and reset gating", () => {
       await settle();
       assert.equal(usageCalls(f), 2, "generic 429 is ignored");
 
-      // TTL long past, but the 2h reset gate holds re-polls.
+      // TTL long past, and still before the reported reset: the next tick rechecks.
       clock.t = T0 + MIN;
       await settle();
-      assert.equal(usageCalls(f), 2, "gated: no poll before the reset");
+      assert.equal(usageCalls(f), 3, "rechecks before the reported reset");
       doc = await rpcStatus(host);
       assert.equal(doc.sources.go.availability, "limited", "capped window keeps the pool limited (fresh data)");
 
@@ -360,7 +360,7 @@ describe("plugin wiring: denial and reset gating", () => {
       goState.body = GO_OK_BODY; // the cap lifts at the reset
       clock.t = T0 + 2 * HOUR + MIN;
       await settle();
-      assert.equal(usageCalls(f), 3, "re-polls at/after the reset");
+      assert.equal(usageCalls(f), 4, "re-polls at/after the reset");
       doc = await rpcStatus(host);
       assert.equal(doc.sources.go.availability, "available");
 
