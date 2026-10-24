@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { SNAPSHOT_KEY, StatusEngine } from "../src/status.ts";
 import type { SourceId } from "../src/status.ts";
-import { deriveAvailability, deriveNextAvailableAt, STALE_AFTER_MS, unknownSource } from "../src/types.ts";
+import { deriveAvailability, deriveNextAvailableAt, STALE_AFTER_MS, STALE_RETRY_MS, unknownSource } from "../src/types.ts";
 import type { QuotaSource, SourceStatus, StorageLike, StatusSnapshot, UsageWindow, WindowState } from "../src/types.ts";
 
 const T0 = 1_758_900_000_000; // fixed instant
@@ -255,8 +255,51 @@ describe("StatusEngine reset rechecks", () => {
   });
 });
 
+describe("StatusEngine unhealthy retry cadence", () => {
+  it("retries an unhealthy source after staleRetryMs, inside the cache TTL", async () => {
+    const clock = fakeClock();
+    const { provider, calls } = scriptedProvider("go", [GO_OK(T0), "fail", GO_OK(T0 + 2 * STALE_RETRY_MS)]);
+    const engine = new StatusEngine({ providers: { go: provider }, storage: memStorage().storage, now: clock.now, ttlMs: MIN });
+
+    await engine.read("go");
+    assert.equal(calls.current, 1);
+
+    clock.set(T0 + MIN); // the cache TTL elapsed
+    await engine.read("go"); // this attempt fails
+    assert.equal(calls.current, 2);
+
+    clock.set(T0 + MIN + STALE_RETRY_MS - 1);
+    await engine.read("go");
+    assert.equal(calls.current, 2, "no retry inside staleRetryMs");
+
+    clock.set(T0 + MIN + STALE_RETRY_MS);
+    await engine.read("go");
+    assert.equal(calls.current, 3, "retries staleRetryMs after the failed attempt, not a full TTL later");
+  });
+
+  it("keeps the cache TTL when the unhealthy source is capped until a known reset", async () => {
+    const clock = fakeClock();
+    const capped = GO_CAPPED_ROLLING(T0, iso(T0 + 30 * DAY));
+    const { provider, calls } = scriptedProvider("go", [capped, "fail", capped]);
+    const engine = new StatusEngine({ providers: { go: provider }, storage: memStorage().storage, now: clock.now, ttlMs: MIN });
+
+    await engine.read("go");
+    clock.set(T0 + MIN);
+    await engine.read("go"); // this attempt fails; the kept windows are still capped
+    assert.equal(calls.current, 2);
+
+    clock.set(T0 + MIN + STALE_RETRY_MS);
+    await engine.read("go");
+    assert.equal(calls.current, 2, "a known cap keeps the full cache TTL");
+
+    clock.set(T0 + 2 * MIN);
+    await engine.read("go");
+    assert.equal(calls.current, 3);
+  });
+});
+
 describe("StatusEngine failures and stale data", () => {
-  it("keeps timestamped stale data on a failed poll and never claims availability", async () => {
+  it("keeps last-known windows on a failed poll, claims no availability, and ages into stale", async () => {
     const clock = fakeClock();
     const { provider, calls } = scriptedProvider("go", [GO_OK(T0), "fail"]);
     const { storage, data } = memStorage();
@@ -268,10 +311,14 @@ describe("StatusEngine failures and stale data", () => {
     const failed = await engine.read("go"); // upstream fails this time
     assert.equal(calls.current, 2);
     assert.equal(failed.availability, "unknown", "a failed poll never reports available");
-    assert.equal(failed.stale, true);
+    assert.equal(failed.stale, false, "one failed poll does not age the data");
     assert.equal(failed.error, "request failed or timed out");
     assert.equal(failed.windows.length, 3, "last known windows retained");
     assert.equal(failed.checkedAt, iso(T0), "original timestamp kept");
+
+    clock.set(T0 + STALE_AFTER_MS + 1); // still no successful poll since T0
+    const aged = await engine.read("go");
+    assert.equal(aged.stale, true, "ages into stale once the data is too old");
 
     const snap = data[SNAPSHOT_KEY] as StatusSnapshot;
     assert.equal(snap.sources.go.availability, "unknown");

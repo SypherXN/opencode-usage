@@ -102,6 +102,17 @@ function mockFetch(status: number, body: unknown): typeof fetch {
   return async () => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }) as unknown as Response;
 }
 
+/** Mock fetch answering from a queue of statuses; records the headers of every call. */
+function scriptedFetch(statuses: number[], body: unknown): { fetchImpl: typeof fetch; calls: string[] } {
+  const calls: string[] = [];
+  const fetchImpl = (async (_url: string, init?: RequestInit) => {
+    calls.push(JSON.stringify(init?.headers ?? {}));
+    const status = statuses[calls.length - 1] ?? 500;
+    return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }) as unknown as Response;
+  }) as unknown as typeof fetch;
+  return { fetchImpl, calls };
+}
+
 describe("codexProvider.fetch", () => {
   it("valid response => authenticated source with ok windows", async () => {
     const provider = codexProvider({
@@ -185,6 +196,39 @@ describe("codexProvider.fetch", () => {
     const result = await provider.fetch();
     assert.equal(result.availability, "unknown");
     assert.match(result.error ?? "", /could not be parsed/);
+  });
+
+  it("401 re-resolves the session token once and retries", async () => {
+    const { fetchImpl, calls } = scriptedFetch([401, 200], {
+      rate_limit: { primary_window: { limit_window_seconds: 3600, used_percent: 3, reset_at: "2026-09-26T00:00:00Z" } },
+    });
+    const result = await codexProvider({
+      accessToken: "expired-token",
+      fetchImpl,
+      refreshCredential: () => ({ access: "renewed-token", accountId: "acct-123" }),
+    }).fetch();
+    assert.equal(result.availability, "available");
+    assert.equal(calls.length, 2, "one retry after the 401");
+    assert.match(calls[1], /renewed-token/);
+    assert.ok(!calls[1].includes("expired-token"), "the retry uses the re-resolved token");
+  });
+
+  it("401 with an unchanged token => authentication failed, no retry", async () => {
+    const { fetchImpl, calls } = scriptedFetch([401, 200], {});
+    const result = await codexProvider({
+      accessToken: "expired-token",
+      fetchImpl,
+      refreshCredential: () => ({ access: "expired-token", accountId: null }),
+    }).fetch();
+    assert.match(result.error ?? "", /authentication failed \(session expired\)/);
+    assert.equal(calls.length, 1, "an unchanged token is not retried");
+  });
+
+  it("401 with no refresh available => authentication failed, no retry", async () => {
+    const { fetchImpl, calls } = scriptedFetch([401, 200], {});
+    const result = await codexProvider({ accessToken: "expired-token", fetchImpl }).fetch();
+    assert.match(result.error ?? "", /authentication failed/);
+    assert.equal(calls.length, 1);
   });
 
   it("serialized SourceStatus carries no credential material", async () => {

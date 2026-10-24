@@ -19,6 +19,7 @@ const TIMEOUT_MS = 15_000;
 interface RawPlanUsage {
   autoPercentUsed?: unknown;
   apiPercentUsed?: unknown;
+  billingCycleEnd?: unknown;
 }
 
 type RawCursorPayload = {
@@ -44,14 +45,20 @@ function normalizePercent(value: unknown): number | null {
   return Math.min(100, Math.max(0, n));
 }
 
-/** Parse billingCycleEnd (ISO string or epoch seconds) to ISO; null when invalid. */
+/** Parse billingCycleEnd (ISO string or epoch seconds/milliseconds) to ISO; null when invalid. */
 function normalizeResetsAt(value: unknown): string | null {
+  const numeric = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim() !== "" ? Number(value) : NaN;
+  if (Number.isFinite(numeric)) {
+    if (numeric <= 0) return null;
+    const t = numeric < 1e12 ? numeric * 1000 : numeric; // heuristic: seconds vs ms
+    const date = new Date(t);
+    if (Number.isFinite(date.getTime())) return date.toISOString();
+    return null;
+  }
   if (typeof value === "string") {
     const t = new Date(value).getTime();
-    if (Number.isFinite(t)) return new Date(t).toISOString();
-  }
-  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-    const t = value < 1e12 ? value * 1000 : value; // heuristic: seconds vs ms
     if (Number.isFinite(t)) return new Date(t).toISOString();
   }
   return null;
@@ -69,7 +76,7 @@ export function parseCursorUsage(payload: unknown): UsageWindow[] {
   const planUsage = root.planUsage;
   if (!planUsage || typeof planUsage !== "object") return [];
   const pu = planUsage as RawPlanUsage;
-  const resetsAt = normalizeResetsAt(root.billingCycleEnd);
+  const resetsAt = normalizeResetsAt(root.billingCycleEnd ?? pu.billingCycleEnd);
 
   const windows: UsageWindow[] = [];
 

@@ -7,13 +7,18 @@
 // Rules:
 // - A source's cache is fresh for ttlMs (~60s). N concurrent readers within
 //   the TTL coalesce into exactly one upstream fetch (in-flight promise).
+// - An unhealthy source (credentialled, last attempt failed) is retried every
+//   staleRetryMs (~15s) instead of the cache TTL, so a transient auth/network
+//   blip clears quickly. A source capped until a known reset keeps the TTL, as
+//   do healthy sources, so the shorter loop tick costs them no extra polls.
 // - A rate-limited window does not suppress later polls. Provider reset times
 //   can arrive early, so the next TTL rechecks the usage endpoint instead of
 //   waiting for resetsAt. Availability still comes from the windows that poll
 //   returns, so a monthly cap stays limited after a 5h window clears.
-// - Auth/network failures keep the last timestamped windows, marked stale,
-//   with availability "unknown" — stale data never claims current availability
-//   or exhaustion.
+// - Auth/network failures keep the last timestamped windows with availability
+//   "unknown" and a safe error — a failure alone never marks the source stale;
+//   only age does (no successful poll for STALE_AFTER_MS). Unknown/stale data
+//   never claims current availability or exhaustion.
 // - refresh() (quota-denial trigger) performs one immediate read-only usage
 //   poll, bypassing the TTL.
 // - The background loop polls read-only usage endpoints only. No inference
@@ -23,6 +28,7 @@ import {
   POLL_CACHE_MS,
   SCHEMA_VERSION,
   STALE_AFTER_MS,
+  STALE_RETRY_MS,
   deriveAvailability,
   deriveNextAvailableAt,
   unknownSource,
@@ -34,6 +40,7 @@ import type {
   StatusSnapshotSource,
   StatusSnapshot,
   StorageLike,
+  UsageWindow,
 } from "./types.ts";
 
 export type SourceId = "go" | "codex" | "cursor";
@@ -60,10 +67,21 @@ interface CacheEntry {
   status: SourceStatus;
   /** ms of the last successful poll; null when never polled successfully. */
   checkedAtMs: number | null;
+  /** ms of the last poll attempt (success or failure); null before the first. */
+  attemptedAtMs: number | null;
   /** True when the most recent poll attempt succeeded. */
   verified: boolean;
   /** In-flight coalesced poll, if any. */
   inFlight?: Promise<SourceStatus>;
+}
+
+/** True when a window is rate-limited until a future, provider-reported reset. */
+function cappedUntilKnownReset(windows: UsageWindow[], nowMs: number): boolean {
+  return windows.some((w) => {
+    if (w.state !== "rate-limited" || w.resetsAt === null) return false;
+    const t = Date.parse(w.resetsAt);
+    return Number.isFinite(t) && t > nowMs;
+  });
 }
 
 function nextMonthlyReset(nowMs: number, day: number): string {
@@ -131,6 +149,7 @@ export class StatusEngine {
         ? unknownSource(id)
         : unknownSource(id, { error: "source not configured" }),
       checkedAtMs: null,
+      attemptedAtMs: null,
       verified: false,
     });
     this.entries = { go: entry("go"), codex: entry("codex"), cursor: entry("cursor") };
@@ -151,7 +170,9 @@ export class StatusEngine {
       if (!src || !src.checkedAt) continue;
       const t = Date.parse(src.checkedAt);
       if (!Number.isFinite(t)) continue;
-      this.entries[id] = { status: { ...src }, checkedAtMs: t, verified: !src.stale };
+      // attemptedAtMs stays null: this process has not polled yet, so a
+      // hydrated-but-unverified source is retried on the first tick.
+      this.entries[id] = { status: { ...src }, checkedAtMs: t, attemptedAtMs: null, verified: !src.stale };
     }
   }
 
@@ -217,8 +238,11 @@ export class StatusEngine {
     };
   }
 
+  // Freshness is AGE, not the last attempt's outcome: a failed poll keeps
+  // serving last-known windows with availability "unknown" and an error, and
+  // only ages into stale once no successful poll has landed for STALE_AFTER_MS.
   private isStale(e: CacheEntry): boolean {
-    if (e.checkedAtMs === null || !e.verified) return true;
+    if (e.checkedAtMs === null) return true;
     return this.now() - e.checkedAtMs > STALE_AFTER_MS;
   }
 
@@ -226,9 +250,20 @@ export class StatusEngine {
     const e = this.entries[id];
     if (!this.providers[id]) return false;
     const nowMs = this.now();
-    const age = e.checkedAtMs === null ? Number.POSITIVE_INFINITY : nowMs - e.checkedAtMs;
-    if (age < this.ttlMs) return false; // fresh — serve cache, no upstream call
-    return true;
+    // Unhealthy (last attempt failed) and not known to be capped: retry from the
+    // last ATTEMPT, faster than the cache TTL, so a blip clears quickly. A
+    // capped source keeps the normal cadence — its state is already known.
+    // (Age alone cannot decide this: an unhealthy source's last SUCCESS is
+    // always older than the TTL, which is why attemptedAtMs exists.)
+    if (!e.verified && e.status.authenticated) {
+      const throttle = cappedUntilKnownReset(e.status.windows, nowMs) ? this.ttlMs : STALE_RETRY_MS;
+      return this.elapsed(e.attemptedAtMs, nowMs) >= throttle;
+    }
+    return this.elapsed(e.checkedAtMs, nowMs) >= this.ttlMs;
+  }
+
+  private elapsed(fromMs: number | null, nowMs: number): number {
+    return fromMs === null ? Number.POSITIVE_INFINITY : nowMs - fromMs;
   }
 
   private poll(id: SourceId, force: boolean): Promise<SourceStatus> {
@@ -263,6 +298,7 @@ export class StatusEngine {
         };
         e.verified = false;
       }
+      e.attemptedAtMs = this.now();
       void this.persist();
       return this.cached(id);
     })().finally(() => {

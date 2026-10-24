@@ -63,6 +63,34 @@ describe("parseCursorUsage", () => {
     assert.ok(invalid.every((window) => window.resetsAt === null));
   });
 
+  it("parses numeric-string seconds and milliseconds and falls back to planUsage", () => {
+    for (const [value, expected] of [
+      ["1790000000", new Date(1790000000 * 1000).toISOString()],
+      ["1790000000000", new Date(1790000000000).toISOString()],
+    ]) {
+      const windows = parseCursorUsage({ planUsage: { autoPercentUsed: 5, apiPercentUsed: 1 }, billingCycleEnd: value });
+      assert.ok(windows.every((window) => window.resetsAt === expected));
+    }
+
+    const nested = parseCursorUsage({
+      planUsage: { autoPercentUsed: 5, apiPercentUsed: 1, billingCycleEnd: "2026-11-01T00:00:00Z" },
+    });
+    assert.ok(nested.every((window) => window.resetsAt === "2026-11-01T00:00:00.000Z"));
+    const rootWins = parseCursorUsage({
+      billingCycleEnd: "2026-12-01T00:00:00Z",
+      planUsage: { autoPercentUsed: 5, apiPercentUsed: 1, billingCycleEnd: "2026-11-01T00:00:00Z" },
+    });
+    assert.ok(rootWins.every((window) => window.resetsAt === "2026-12-01T00:00:00.000Z"));
+  });
+
+  it("keeps malformed and out-of-range reset values unknown without throwing", () => {
+    for (const billingCycleEnd of ["not-a-date", "0", "8640000000000001", 8640000000000001]) {
+      const windows = parseCursorUsage({ planUsage: { autoPercentUsed: 5, apiPercentUsed: 1 }, billingCycleEnd });
+      assert.equal(windows.length, 2);
+      assert.ok(windows.every((window) => window.resetsAt === null));
+    }
+  });
+
   it("returns empty when disabled, missing plan usage, or no auto/api bars exist", () => {
     assert.equal(parseCursorUsage({ enabled: false, planUsage: { autoPercentUsed: 50 } }).length, 0);
     assert.equal(parseCursorUsage({ enabled: true }).length, 0);
@@ -123,6 +151,19 @@ describe("cursorProvider.fetch", () => {
     assert.equal(result.windows.length, 2);
     assert.equal(result.availability, "available");
     assert.equal(result.checkedAt, new Date(1758900000000).toISOString());
+  });
+
+  it("returns authoritative reset dates for both windows without estimated flags", async () => {
+    const provider = cursorProvider({
+      accessToken: "test-token",
+      fetchImpl: mockFetch(200, {
+        planUsage: { autoPercentUsed: 5, apiPercentUsed: 1 },
+        billingCycleEnd: "1790000000",
+      }),
+    });
+    const result = await provider.fetch();
+    assert.ok(result.windows.every((window) => window.resetsAt === new Date(1790000000 * 1000).toISOString()));
+    assert.ok(result.windows.every((window) => !("resetEstimated" in window)));
   });
 
   it("sends a Connect-RPC POST with the right URL, headers and body", async () => {

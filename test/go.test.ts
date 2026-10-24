@@ -161,3 +161,39 @@ test("serialized SourceStatus carries no credential material", async () => {
     assert.ok(!json.toLowerCase().includes(forbidden), `status must not contain "${forbidden}"`);
   }
 });
+
+/** Mock fetch answering from a queue of statuses; records the headers of every call. */
+function scriptedFetch(statuses: number[], body: unknown): { fetchImpl: typeof fetch; calls: string[] } {
+  const calls: string[] = [];
+  const fetchImpl = (async (_url: string, init?: RequestInit) => {
+    calls.push(JSON.stringify(init?.headers ?? {}));
+    const status = statuses[calls.length - 1] ?? 500;
+    return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+  return { fetchImpl, calls };
+}
+
+const OK_BODY = { usage: { rolling: { percent: 5, resetsAt: "2026-09-26T17:00:00Z" } } };
+
+test("fetch: a rejected key is re-resolved once and retried", async () => {
+  const { fetchImpl, calls } = scriptedFetch([401, 200], OK_BODY);
+  const s = await goProvider({ apiKey: "old-key", fetchImpl, now: () => NOW, refreshCredential: () => "rotated-key" }).fetch();
+  assert.equal(s.availability, "available");
+  assert.equal(calls.length, 2, "one retry after the 401");
+  assert.match(calls[1], /rotated-key/);
+  assert.ok(!calls[1].includes("old-key"), "the retry uses the re-resolved key");
+});
+
+test("fetch: a rotated key that is rejected too => one retry, then authentication failed", async () => {
+  const { fetchImpl, calls } = scriptedFetch([401, 401], {});
+  const s = await goProvider({ apiKey: "old", fetchImpl, refreshCredential: () => "new" }).fetch();
+  assert.equal(s.error, "authentication failed");
+  assert.equal(calls.length, 2, "exactly one retry — never a loop");
+});
+
+test("fetch: 401 with no rotated key => authentication failed, no retry", async () => {
+  const { fetchImpl, calls } = scriptedFetch([401, 200], OK_BODY);
+  const s = await goProvider({ apiKey: "only", fetchImpl, refreshCredential: () => null }).fetch();
+  assert.equal(s.error, "authentication failed");
+  assert.equal(calls.length, 1);
+});

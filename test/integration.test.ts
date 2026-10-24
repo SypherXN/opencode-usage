@@ -2,7 +2,7 @@
 //
 // In-process: a fake host captures the RPC/hook registrations, a scripted
 // fetch routes the Go usage endpoint (everything else 404s), a fake clock
-// drives the TTL/reset-gate math, and a real (throwaway) SQLite file
+// drives the TTL/cache math, and a real (throwaway) SQLite file
 // supplies the Go credential. No live network, no quota-consuming calls, and
 // the environment is scrubbed so the real credential DB is never read.
 
@@ -320,7 +320,7 @@ describe("plugin wiring: credentialed status flow", () => {
   });
 });
 
-describe("plugin wiring: denial and reset gating", () => {
+describe("plugin wiring: denial handling", () => {
   it("a Go denial triggers one immediate refresh; a later tick rechecks before the reset", async () => {
     const restoreEnv = scrubEnv();
     try {
@@ -421,7 +421,7 @@ describe("plugin wiring: denial and reset gating", () => {
       const doc = await rpcStatus(host);
       assert.equal(doc.sources.go.availability, "unknown", "a failed poll never claims availability");
       assert.equal(doc.sources.go.error, "usage API returned HTTP 500");
-      assert.equal(doc.sources.go.stale, true);
+      assert.equal(doc.sources.go.stale, false, "one failed poll does not age the data");
       assert.equal(doc.sources.go.windows.length, 3, "last-known windows retained");
 
       await cleanup();

@@ -92,6 +92,11 @@ export interface CodexProviderOptions {
   accessToken?: string | null;
   /** Optional ChatGPT-Account-Id header value. */
   accountId?: string | null;
+  /**
+   * Re-resolve the session credential after a 401 (the token expires while the
+   * plugin runs). Called at most once per fetch, and only when rejected.
+   */
+  refreshCredential?: () => { access: string; accountId: string | null } | null;
   /** Injectable fetch for tests. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
   /** Injectable clock for tests. Defaults to Date.now. */
@@ -103,22 +108,42 @@ export function codexProvider(opts: CodexProviderOptions = {}): { id: "codex"; f
   const fetchImpl = opts.fetchImpl ?? fetch;
   const now = opts.now ?? (() => Date.now());
 
+  const send = (accessToken: string, accountId: string | null): Promise<Response> => {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    };
+    if (accountId) headers["ChatGPT-Account-Id"] = accountId;
+    return fetchImpl(CODEX_USAGE_URL, { headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
+  };
+
   return {
     id: "codex",
     async fetch(): Promise<SourceStatus> {
-      const accessToken = opts.accessToken ?? null;
+      let accessToken = opts.accessToken ?? null;
       if (!accessToken) return unknownSource("codex", { error: "credential not found" });
+      let accountId = opts.accountId ?? null;
 
       let response: Response;
       try {
-        const headers: Record<string, string> = {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        };
-        if (opts.accountId) headers["ChatGPT-Account-Id"] = opts.accountId;
-        response = await fetchImpl(CODEX_USAGE_URL, { headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
+        response = await send(accessToken, accountId);
       } catch {
         return unknownSource("codex", { authenticated: true, error: "request failed or timed out" });
+      }
+
+      // The session token expires while the plugin runs: re-resolve once, retry
+      // once, so a long-lived process does not sit on an expired token forever.
+      if (response.status === 401) {
+        const renewed = opts.refreshCredential?.() ?? null;
+        if (renewed && renewed.access !== accessToken) {
+          accessToken = renewed.access;
+          accountId = renewed.accountId;
+          try {
+            response = await send(accessToken, accountId);
+          } catch {
+            return unknownSource("codex", { authenticated: true, error: "request failed or timed out" });
+          }
+        }
       }
 
       if (response.status === 401) {

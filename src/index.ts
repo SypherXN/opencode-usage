@@ -28,6 +28,7 @@ import { StatusEngine } from "./status.ts";
 import {
   POLL_CACHE_MS,
   SCHEMA_VERSION,
+  STALE_RETRY_MS,
   type StatusSnapshot,
   type StorageLike,
 } from "./types.ts";
@@ -121,10 +122,18 @@ export async function createRuntime(
 
   // Providers: never throw; a missing credential means "credential not found", no request.
   const providers = {
-    go: goProvider({ apiKey: goKey, fetchImpl, now }),
+    go: goProvider({
+      apiKey: goKey,
+      // Rejected key only: re-read the credential DB in case it rotated.
+      refreshCredential: () => resolveGoKey(loadCredentials()),
+      fetchImpl,
+      now,
+    }),
     codex: codexProvider({
       accessToken: codexCred?.access ?? null,
       accountId: codexCred?.accountId ?? null,
+      // Expired session only: pick up the token OpenCode has since written.
+      refreshCredential: () => resolveCodex(loadCredentials()),
       fetchImpl,
       now,
     }),
@@ -203,11 +212,14 @@ export async function createRuntime(
   );
 
   // The interval is the ONLY timer we own. Overlapping ticks can never double-
-  // poll: the engine coalesces in-flight polls and gates on TTL + resets.
+  // poll: the engine coalesces in-flight polls and gates each source on its own
+  // cache age. The tick is shorter than the cache TTL so an unhealthy source
+  // retries sooner; healthy sources still fetch once per TTL.
+  const tickMs = Math.min(ttlMs, STALE_RETRY_MS);
   void tick().catch(() => {}); // publish promptly (the first pass polls cold sources)
   const timer = setInterval(() => {
     void tick().catch(() => {});
-  }, ttlMs);
+  }, tickMs);
   timer.unref?.();
 
   return async () => {

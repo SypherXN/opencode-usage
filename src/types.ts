@@ -119,6 +119,8 @@ export interface StorageLike {
 /** Freshness bounds. Poll cache ~60s; anything older is stale. */
 export const POLL_CACHE_MS = 60_000;
 export const STALE_AFTER_MS = 5 * 60_000;
+/** Retry cadence for a credentialled source whose last poll failed or aged out. */
+export const STALE_RETRY_MS = 15_000;
 
 /** Build a SourceStatus that represents "we know nothing" without implying availability. */
 export function unknownSource(id: string, opts?: { error?: string; authenticated?: boolean }): SourceStatus {

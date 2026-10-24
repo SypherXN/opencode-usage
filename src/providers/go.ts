@@ -55,8 +55,8 @@ export function parseGoUsage(payload: unknown): UsageWindow[] {
     if (usedPercent === null) continue; // never coerce invalid to zero
     const resetsAt = normalizeResetsAt(entry.resetsAt);
     // A fully-consumed window is exhausted by definition: the provider's own
-    // reported percent (clamped to [0,100]) marks it rate-limited so the
-    // status engine can gate re-polls until the reported reset (#11).
+    // reported percent (clamped to [0,100]) marks it rate-limited. The window is
+    // data, not a poll gate — polling continues on the normal cache interval.
     windows.push({ name, usedPercent, state: usedPercent >= 100 ? "rate-limited" : "ok", resetsAt });
   }
   return windows;
@@ -65,6 +65,11 @@ export function parseGoUsage(payload: unknown): UsageWindow[] {
 export interface GoProviderOptions {
   /** Bearer API key. When omitted, fetch() returns an unauthenticated unknown source. */
   apiKey?: string | null;
+  /**
+   * Re-resolve the key after a 401/403 (it may have rotated on disk). Called at
+   * most once per fetch, and only when the request was rejected.
+   */
+  refreshCredential?: () => string | null;
   /** Injectable fetch for tests. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
   /** Injectable clock for tests. Defaults to Date.now. */
@@ -76,26 +81,42 @@ export function goProvider(opts: GoProviderOptions = {}): { id: "go"; fetch(): P
   const fetchImpl = opts.fetchImpl ?? fetch;
   const now = opts.now ?? (() => Date.now());
 
+  const send = (apiKey: string): Promise<Response> =>
+    fetchImpl(GO_USAGE_URL, {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        "x-opencode-session": "openchamber-usage",
+        "User-Agent": "OpenChamber quota provider",
+      },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+
   return {
     id: "go",
     async fetch(): Promise<SourceStatus> {
-      const apiKey = opts.apiKey ?? null;
+      let apiKey = opts.apiKey ?? null;
       if (!apiKey) return unknownSource("go", { error: "credential not found" });
 
       let response: Response;
       try {
-        response = await fetchImpl(GO_USAGE_URL, {
-          headers: {
-            Accept: "application/json",
-            Authorization: `Bearer ${apiKey}`,
-            "x-opencode-session": "openchamber-usage",
-            "User-Agent": "OpenChamber quota provider",
-          },
-          signal: AbortSignal.timeout(TIMEOUT_MS),
-        });
+        response = await send(apiKey);
       } catch {
         // Network failure / timeout — keep stale data, report unknown.
         return unknownSource("go", { authenticated: true, error: "request failed or timed out" });
+      }
+
+      // A rejected key may have rotated on disk: re-resolve once, retry once.
+      if (response.status === 401 || response.status === 403) {
+        const rotated = opts.refreshCredential?.() ?? null;
+        if (rotated && rotated !== apiKey) {
+          apiKey = rotated;
+          try {
+            response = await send(apiKey);
+          } catch {
+            return unknownSource("go", { authenticated: true, error: "request failed or timed out" });
+          }
+        }
       }
 
       if (response.status === 401 || response.status === 403) {
