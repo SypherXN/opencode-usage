@@ -92,6 +92,7 @@ export function initialSnapshot(now: Date = new Date()): StatusSnapshot {
     windows: [],
     nextAvailableAt: null,
     availability: "unknown" as const,
+    plan: null,
   };
   return {
     schemaVersion: SCHEMA_VERSION,

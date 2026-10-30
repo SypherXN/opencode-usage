@@ -52,6 +52,11 @@ export interface SourceStatus extends Record<string, JsonValue> {
   windows: UsageWindow[];
   /** Derived from all active windows; "unknown" on auth/network failure. */
   availability: Availability;
+  /**
+   * Provider-reported plan name when the source exposes one read-only.
+   * Cursor: "Free" | "Pro" | "Ultra" etc. null when the source has none or the probe failed.
+   */
+  plan: string | null;
 }
 
 /** Public status shape with a derived time until all active limits reset. */
@@ -132,6 +137,7 @@ export function unknownSource(id: string, opts?: { error?: string; authenticated
     error: opts?.error ?? null,
     windows: [],
     availability: "unknown",
+    plan: null,
   };
 }
 

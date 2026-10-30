@@ -44,6 +44,7 @@ function okSource(id: SourceId, wins: WinSpec[], atMs: number): SourceStatus {
     error: null,
     windows,
     availability: deriveAvailability(windows),
+    plan: null,
   };
 }
 

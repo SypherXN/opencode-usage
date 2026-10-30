@@ -14,6 +14,9 @@ import { deriveAvailability, unknownSource } from "../types.ts";
 import { refreshCursorToken } from "../cursor-auth.ts";
 
 const USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
+// Read-only entitlement probe: same Connect-RPC service, same bearer token, no quota.
+// The usage endpoint cannot report this, which is why a Free account still shows 0%/0%.
+const PLAN_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo";
 const TIMEOUT_MS = 15_000;
 
 interface RawPlanUsage {
@@ -113,8 +116,8 @@ export function cursorProvider(opts: CursorProviderOptions = {}): { id: "cursor"
   let accessToken = opts.accessToken ?? null;
   let refreshToken = opts.refreshToken ?? null;
 
-  const post = (token: string): Promise<Response> =>
-    fetchImpl(USAGE_URL, {
+  const post = (token: string, url: string = USAGE_URL): Promise<Response> =>
+    fetchImpl(url, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -124,6 +127,23 @@ export function cursorProvider(opts: CursorProviderOptions = {}): { id: "cursor"
       body: "{}",
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
+
+  /**
+   * Best-effort plan name. This is the only entitlement signal Cursor exposes
+   * read-only; the usage payload reports consumption only. Never fails the poll:
+   * a probe error just leaves the plan unknown (null).
+   */
+  async function planName(token: string): Promise<string | null> {
+    try {
+      const response = await post(token, PLAN_URL);
+      if (!response.ok) return null;
+      const json = (await response.json()) as { planInfo?: { planName?: unknown } } | null;
+      const name = json?.planInfo?.planName;
+      return typeof name === "string" && name.trim() !== "" ? name : null;
+    } catch {
+      return null;
+    }
+  }
 
   return {
     id: "cursor",
@@ -195,6 +215,7 @@ export function cursorProvider(opts: CursorProviderOptions = {}): { id: "cursor"
         error: null,
         windows,
         availability: deriveAvailability(windows),
+        plan: await planName(accessToken),
       };
     },
   };

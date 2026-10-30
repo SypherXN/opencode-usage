@@ -190,7 +190,7 @@ describe("GoAttribution.observe", () => {
       stale: false,
       error: null,
       windows: [],
-      availability: "available",
+      availability: "available", plan: null,
     });
     assert.equal(est["kimi-k3"].observedTokens, 1_500_000);
     assert.ok(Math.abs((est["kimi-k3"].estimatedCostUSD ?? 0) - 10.5) < 1e-9);
@@ -202,7 +202,7 @@ describe("GoAttribution.observe", () => {
     const body = completionBody("same-id", 1000, 100);
     assert.equal(await attr.observe({ providerID: "opencode-go", modelId: "kimi-k3", response: new Response(body) }), true);
     assert.equal(await attr.observe({ providerID: "opencode-go", modelId: "kimi-k3", response: new Response(body) }), false);
-    const est = attr.estimates({ authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown" });
+    const est = attr.estimates({ authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown", plan: null });
     assert.equal(est["kimi-k3"].observedTokens, 1100);
   });
 
@@ -211,7 +211,7 @@ describe("GoAttribution.observe", () => {
     assert.equal(await attr.observe({ providerID: "anthropic", modelId: "claude-x", response: new Response(completionBody("r9", 10, 10)) }), false);
     assert.equal(await attr.observe({ providerID: "opencode-go", modelId: "kimi-k3", response: new Response("not json") }), false);
     assert.equal(
-      Object.keys(attr.estimates({ authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown" })).length,
+      Object.keys(attr.estimates({ authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown", plan: null })).length,
       0,
     );
   });
@@ -229,7 +229,7 @@ describe("GoAttribution.observe", () => {
     for (const id of ["a", "b", "c", "d"]) {
       assert.equal(await attr.observe({ providerID: "opencode-go", modelId: "kimi-k3", response: new Response(completionBody(id, 100, 100)) }), true);
     }
-    const est = attr.estimates({ authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown" });
+    const est = attr.estimates({ authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown", plan: null });
     assert.equal(est["kimi-k3"].observedTokens, 3 * 200);
     assert.equal(await attr.observe({ providerID: "opencode-go", modelId: "kimi-k3", response: new Response(completionBody("a", 100, 100)) }), true);
   });
@@ -237,7 +237,7 @@ describe("GoAttribution.observe", () => {
   it("records tokens with null cost for a model without published pricing", async () => {
     const { attr } = await withCatalog();
     await attr.observe({ providerID: "opencode-go", modelId: "mystery-model", response: new Response(completionBody("m1", 1000, 500)) });
-    const est = attr.estimates({ authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown" });
+    const est = attr.estimates({ authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown", plan: null });
     assert.equal(est["mystery-model"].observedTokens, 1500);
     assert.equal(est["mystery-model"].estimatedCostUSD, null);
     assert.equal(est["mystery-model"].priceProvenance, null);
@@ -276,7 +276,7 @@ describe("GoAttribution denials", () => {
       stale: false,
       error: null,
       windows: [],
-      availability: "limited",
+      availability: "limited", plan: null,
     });
     assert.equal(est["kimi-k3"].effectiveAvailability, "limited");
     assert.equal(est["space-bunny-free"].free, true);
@@ -293,7 +293,7 @@ describe("GoAttribution denials", () => {
       stale: false,
       error: null,
       windows: [],
-      availability: "available",
+      availability: "available", plan: null,
     });
     assert.equal(est["kimi-k3"].effectiveAvailability, "available");
   });
@@ -301,7 +301,7 @@ describe("GoAttribution denials", () => {
   it("a fresh authoritative poll after the denial clears the flag", async () => {
     const { attr } = await withState();
     assert.equal(await attr.onDenial({ status: 429, type: "GoUsageLimitError", message: "limit" }), true);
-    const fresh: SourceStatus = { authenticated: true, checkedAt: iso(T0 + 5_000), stale: false, error: null, windows: [], availability: "available" };
+    const fresh: SourceStatus = { authenticated: true, checkedAt: iso(T0 + 5_000), stale: false, error: null, windows: [], availability: "available", plan: null };
     assert.equal(attr.denialCurrent(fresh), false);
     assert.equal(attr.estimates(fresh)["kimi-k3"].effectiveAvailability, "available");
   });
@@ -309,7 +309,7 @@ describe("GoAttribution denials", () => {
   it("stale data after the denial keeps the flag (never a false available)", async () => {
     const { attr } = await withState();
     assert.equal(await attr.onDenial({ status: 429, type: "GoUsageLimitError", message: "limit" }), true);
-    const staleAfter: SourceStatus = { authenticated: true, checkedAt: iso(T0 + 5_000), stale: true, error: "authentication failed", windows: [], availability: "unknown" };
+    const staleAfter: SourceStatus = { authenticated: true, checkedAt: iso(T0 + 5_000), stale: true, error: "authentication failed", windows: [], availability: "unknown", plan: null };
     assert.equal(attr.denialCurrent(staleAfter), true);
     assert.equal(attr.estimates(staleAfter)["kimi-k3"].effectiveAvailability, "limited");
   });
@@ -343,7 +343,7 @@ describe("GoAttribution window attribution", () => {
         { name: "monthly", usedPercent: 30, state: "ok", resetsAt: iso(T0 + 10 * DAY) },
         { name: "mystery", usedPercent: 90, state: "rate-limited", resetsAt: null },
       ],
-      availability: "available",
+      availability: "available", plan: null,
     });
     const e = est["kimi-k3"];
     assert.equal(e.observedTokens, 4_500_000, "cumulative over the bounded retention");
@@ -368,7 +368,7 @@ describe("GoAttribution window attribution", () => {
       stale: false,
       error: null,
       windows: [],
-      availability: "limited",
+      availability: "limited", plan: null,
     });
     assert.equal(est["space-bunny-free"].free, true);
     assert.equal(est["space-bunny-free"].effectiveAvailability, "available");
@@ -387,7 +387,7 @@ describe("GoAttribution persistence", () => {
 
     const second = new GoAttribution({ storage, now: () => T0 });
     await second.hydrate();
-    const unknown: SourceStatus = { authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown" };
+    const unknown: SourceStatus = { authenticated: true, checkedAt: null, stale: true, error: null, windows: [], availability: "unknown", plan: null };
     assert.equal(second.denialCurrent(unknown), true);
     const est = second.estimates(unknown);
     assert.equal(est["kimi-k3"].observedTokens, 1_500_000);

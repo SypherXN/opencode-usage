@@ -145,6 +145,7 @@ export function goProvider(opts: GoProviderOptions = {}): { id: "go"; fetch(): P
         error: null,
         windows,
         availability: deriveAvailability(windows),
+        plan: null,
       };
     },
   };

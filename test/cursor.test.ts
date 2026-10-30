@@ -167,10 +167,13 @@ describe("cursorProvider.fetch", () => {
   });
 
   it("sends a Connect-RPC POST with the right URL, headers and body", async () => {
-    const { fetchImpl, calls } = scriptFetch([{ status: 200, body: FULL_PAYLOAD }]);
+    const { fetchImpl, calls } = scriptFetch([
+      { status: 200, body: FULL_PAYLOAD },
+      { status: 200, body: { planInfo: { planName: "Pro" } } },
+    ]);
     const provider = cursorProvider({ accessToken: "tok", fetchImpl });
     await provider.fetch();
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 2);
     assert.equal(calls[0].url, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage");
     assert.equal(calls[0].init?.method, "POST");
     assert.equal(calls[0].init?.body, "{}");
@@ -199,6 +202,7 @@ describe("cursorProvider.fetch", () => {
       { status: 401, body: {} },
       { status: 200, body: { access_token: "new-token" } },
       { status: 200, body: FULL_PAYLOAD },
+      { status: 200, body: { planInfo: { planName: "Ultra" } } },
     ]);
     const provider = cursorProvider({
       accessToken: "stale-token",
@@ -208,7 +212,8 @@ describe("cursorProvider.fetch", () => {
     });
     const result = await provider.fetch();
     assert.equal(result.availability, "available");
-    assert.equal(calls.length, 3);
+    assert.equal(result.plan, "Ultra");
+    assert.equal(calls.length, 4);
     assert.equal(calls[1].url, REFRESH_URL);
     const refreshBody = JSON.parse(String(calls[1].init?.body)) as Record<string, unknown>;
     assert.equal(refreshBody.grant_type, "refresh_token");
@@ -298,6 +303,30 @@ describe("cursorProvider.fetch", () => {
     const result = await provider.fetch();
     assert.equal(result.availability, "unknown");
     assert.match(result.error ?? "", /could not be parsed/);
+  });
+
+  it("reads the plan name from GetPlanInfo", async () => {
+    const { fetchImpl, calls } = scriptFetch([
+      { status: 200, body: FULL_PAYLOAD },
+      { status: 200, body: { planInfo: { planName: "Free" } } },
+    ]);
+    const provider = cursorProvider({ accessToken: "tok", fetchImpl });
+    const result = await provider.fetch();
+    assert.equal(result.plan, "Free");
+    assert.equal(calls[1].url, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo");
+    assert.equal(calls[1].init?.body, "{}");
+  });
+
+  it("plan probe failure leaves the plan unknown and the windows intact", async () => {
+    const { fetchImpl } = scriptFetch([
+      { status: 200, body: FULL_PAYLOAD },
+      { status: 404, body: {} },
+    ]);
+    const provider = cursorProvider({ accessToken: "tok", fetchImpl });
+    const result = await provider.fetch();
+    assert.equal(result.plan, null);
+    assert.equal(result.availability, "available");
+    assert.equal(result.windows.length, 2);
   });
 
   it("serialized SourceStatus carries no credential material", async () => {

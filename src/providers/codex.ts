@@ -172,6 +172,7 @@ export function codexProvider(opts: CodexProviderOptions = {}): { id: "codex"; f
         error: null,
         windows,
         availability: deriveAvailability(windows),
+        plan: null,
       };
     },
   };

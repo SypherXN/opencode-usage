@@ -27,6 +27,7 @@ function source(overrides: Partial<SourceStatus> = {}): StatusSnapshotSource {
     error: null,
     windows: [{ name: "rolling", usedPercent: 20, state: "ok", resetsAt: null }],
     availability: "available",
+    plan: null,
     nextAvailableAt: null,
     ...overrides,
   };

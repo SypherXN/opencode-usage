@@ -46,6 +46,7 @@ const sourceSchema = z.object({
   windows: z.array(windowSchema),
   nextAvailableAt: z.string().nullable(),
   availability,
+  plan: z.string().nullable().optional(),
 });
 
 // ponytail: passthrough preserves additive estimate fields (e.g. #8's byWindow).
