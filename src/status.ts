@@ -59,6 +59,8 @@ export interface StatusEngineOptions {
   now?: () => number;
   /** Cache TTL / background poll interval. Defaults to POLL_CACHE_MS (~60s). */
   ttlMs?: number;
+  /** Per-source TTL overrides (e.g. a slower cadence for a shared, rate-limited endpoint). */
+  sourceTtlMs?: Partial<Record<SourceId, number>>;
   /** One-time estimated Cursor reset date, superseded by provider or observed resets. */
   cursorResetAt?: string;
 }
@@ -133,6 +135,7 @@ export class StatusEngine {
   private readonly storage: StorageLike | null;
   private readonly now: () => number;
   private readonly ttlMs: number;
+  private readonly sourceTtlMs: Partial<Record<SourceId, number>>;
   private readonly cursorResetAt?: string;
   private readonly entries: Record<SourceId, CacheEntry>;
   private estimator: (go: SourceStatus) => Record<string, GoModelEstimate> = () => ({});
@@ -143,6 +146,7 @@ export class StatusEngine {
     this.storage = opts.storage ?? null;
     this.now = opts.now ?? (() => Date.now());
     this.ttlMs = opts.ttlMs ?? POLL_CACHE_MS;
+    this.sourceTtlMs = opts.sourceTtlMs ?? {};
     this.cursorResetAt = opts.cursorResetAt;
     const entry = (id: SourceId): CacheEntry => ({
       status: this.providers[id]
@@ -264,16 +268,17 @@ export class StatusEngine {
     const e = this.entries[id];
     if (!this.providers[id]) return false;
     const nowMs = this.now();
+    const ttl = this.sourceTtlMs[id] ?? this.ttlMs;
     // Unhealthy (last attempt failed) and not known to be capped: retry from the
     // last ATTEMPT, faster than the cache TTL, so a blip clears quickly. A
     // capped source keeps the normal cadence — its state is already known.
     // (Age alone cannot decide this: an unhealthy source's last SUCCESS is
     // always older than the TTL, which is why attemptedAtMs exists.)
     if (!e.verified && e.status.authenticated) {
-      const throttle = cappedUntilKnownReset(e.status.windows, nowMs) ? this.ttlMs : STALE_RETRY_MS;
+      const throttle = cappedUntilKnownReset(e.status.windows, nowMs) ? ttl : STALE_RETRY_MS;
       return this.elapsed(e.attemptedAtMs, nowMs) >= throttle;
     }
-    return this.elapsed(e.checkedAtMs, nowMs) >= this.ttlMs;
+    return this.elapsed(e.checkedAtMs, nowMs) >= ttl;
   }
 
   private elapsed(fromMs: number | null, nowMs: number): number {

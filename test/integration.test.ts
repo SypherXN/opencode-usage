@@ -91,6 +91,8 @@ const ENV_KEYS = [
   "CURSOR_TOKEN_FILE",
   "CURSOR_REFRESH_TOKEN_FILE",
   "OPENCHAMBER_DATA_DIR",
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_CODE_OAUTH_TOKEN",
 ];
 
 function scrubEnv(): () => void {
@@ -100,6 +102,8 @@ function scrubEnv(): () => void {
     delete process.env[k];
   }
   process.env.OPENCHAMBER_DATA_DIR = path.join(tmpdir(), `gmu-openchamber-${process.pid}-${Date.now()}`);
+  // Empty dir: the real Claude Code login must never be read by tests.
+  process.env.CLAUDE_CONFIG_DIR = path.join(tmpdir(), `gmu-claude-${process.pid}-${Date.now()}`);
   return () => {
     for (const k of ENV_KEYS) {
       if (saved[k] === undefined) delete process.env[k];

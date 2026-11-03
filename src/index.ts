@@ -24,6 +24,8 @@ import { codexProvider } from "./providers/codex.ts";
 import { goProvider } from "./providers/go.ts";
 import { cursorProvider } from "./providers/cursor.ts";
 import { ClaudeAgentObserver } from "./providers/claude-agent.ts";
+import { CLAUDE_POLL_MS, claudeProvider } from "./providers/claude.ts";
+import { resolveClaudeToken } from "./claude-auth.ts";
 import { createStatusHandler, USAGE_RPC } from "./rpc.ts";
 import { StatusEngine } from "./status.ts";
 import {
@@ -149,10 +151,19 @@ export async function createRuntime(
       fetchImpl,
       now,
     }),
+    // Claude Code's login token is re-read per poll (it rotates); never stored.
+    // Registered only when a login exists at startup; otherwise the passive
+    // step-event path stays the sole (and unpolled) source.
+    ...(resolveClaudeToken(now())
+      ? { "claude-agent": claudeProvider({ resolveToken: () => resolveClaudeToken(now()), fetchImpl, now }) }
+      : {}),
   };
 
   // Engine (single owner of polling) + Go attribution (estimates only).
-  const engine = new StatusEngine({ providers, storage, now, ttlMs, cursorResetAt: deps.cursorResetAt });
+  const engine = new StatusEngine({ providers, storage, now, ttlMs,
+    sourceTtlMs: { "claude-agent": Math.max(ttlMs, CLAUDE_POLL_MS) },
+    cursorResetAt: deps.cursorResetAt,
+  });
   const attribution = new GoAttribution({
     storage,
     fetchImpl,
