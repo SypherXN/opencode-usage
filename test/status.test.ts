@@ -254,6 +254,24 @@ describe("StatusEngine reset rechecks", () => {
     assert.equal(refreshed.stale, false);
     assert.equal(refreshed.nextAvailableAt, iso(T0 + 2 * HOUR));
   });
+
+  it("a free plan reports limited even when every window reads 0%", async () => {
+    const clock = fakeClock();
+    const freeAt = (atMs: number): SourceStatus => ({
+      ...okSource("cursor", [{ name: "auto", percent: 0, resetsAt: iso(T0 + 30 * DAY) }], atMs),
+      // A provider-level "available" must not survive the engine's re-derivation.
+      availability: "available",
+      plan: "Free",
+    });
+    const { provider } = scriptedProvider("cursor", [freeAt(T0)]);
+    const engine = new StatusEngine({ providers: { cursor: provider }, storage: memStorage().storage, now: clock.now });
+
+    const status = await engine.read("cursor");
+
+    assert.equal(status.plan, "Free");
+    assert.equal(status.availability, "limited");
+    assert.equal(status.nextAvailableAt, null, "no reset restores a paid pool that was never entitled");
+  });
 });
 
 describe("StatusEngine unhealthy retry cadence", () => {

@@ -127,15 +127,35 @@ interface FakeHost {
   ctx: PluginRuntimeCtx;
   hooks: HookEntry[];
   rpcs: RpcEntry[];
+  emit(event: unknown): void;
+  eventsAborted: boolean;
 }
 
 function makeHost(storage: StorageLike, projectDir: string): FakeHost {
   const hooks: HookEntry[] = [];
   const rpcs: RpcEntry[] = [];
+  const queue: unknown[] = [];
+  let wake: (() => void) | undefined;
+  let eventsAborted = false;
   const ctx: PluginRuntimeCtx = {
     location: { directory: projectDir },
     options: {},
     storage,
+    event: {
+      async *subscribe({ signal }) {
+        const abort = () => { eventsAborted = true; wake?.(); };
+        signal.addEventListener("abort", abort, { once: true });
+        try {
+          while (!signal.aborted) {
+            if (!queue.length) await new Promise<void>((resolve) => { wake = resolve; });
+            if (signal.aborted) break;
+            while (queue.length) yield queue.shift();
+          }
+        } finally {
+          signal.removeEventListener("abort", abort);
+        }
+      },
+    },
     rpc: {
       register: async (definition, handlers) => {
         const entry: RpcEntry = { definition, handlers, disposed: false };
@@ -159,7 +179,11 @@ function makeHost(storage: StorageLike, projectDir: string): FakeHost {
       },
     },
   };
-  return { ctx, hooks, rpcs };
+  return {
+    ctx, hooks, rpcs,
+    emit(event) { queue.push(event); wake?.(); },
+    get eventsAborted() { return eventsAborted; },
+  };
 }
 
 // ---- scripted fetch (routes the Go usage endpoint; everything else 404s) ----
@@ -231,7 +255,7 @@ describe("plugin wiring: startup", () => {
 
       await settle();
       const doc = await rpcStatus(host);
-      for (const id of ["go", "codex", "cursor"] as const) {
+      for (const id of ["go", "codex", "cursor", "claude-agent"] as const) {
         assert.equal(doc.sources[id].authenticated, false);
         assert.equal(doc.sources[id].availability, "unknown");
         assert.deepEqual(doc.sources[id].windows, []);
@@ -250,6 +274,45 @@ describe("plugin wiring: startup", () => {
       restoreEnv();
     }
   });
+});
+
+test("Claude step events reach RPC and file without requests, and unsubscribe on unload", async () => {
+  const restoreEnv = scrubEnv();
+  let cleanup: (() => Promise<void>) | undefined;
+  try {
+    const dir = freshTmp();
+    process.env.OPENCODE_DATA = path.join(dir, "empty-data");
+    const f = makeFetch({ body: GO_OK_BODY });
+    const filePath = path.join(dir, "usage.json");
+    const booted = await boot(dir, { fetchImpl: f.fetchImpl, now: () => T0, filePath });
+    cleanup = booted.cleanup;
+    const { host } = booted;
+    await settle();
+    const before = f.calls.length;
+    host.emit({ type: "session.step.started", created: T0, data: {
+      sessionID: "s", assistantMessageID: "m", model: { providerID: "claude-agent", id: "sonnet" },
+    } });
+    host.emit({ type: "session.step.ended", created: T0, data: {
+      sessionID: "s", assistantMessageID: "m", native: {
+        rateLimit: { status: "allowed_warning", utilization: 0.8, rateLimitType: "five_hour", resetsAt: (T0 + HOUR) / 1000 },
+        unrelated: "private text must not be retained",
+      },
+    } });
+    await settle();
+    const doc = await rpcStatus(host, { refresh: true });
+    assert.equal(doc.sources["claude-agent"].windows[0].usedPercent, 80);
+    assert.equal(doc.sources["claude-agent"].checkedAt, iso(T0));
+    assert.equal(f.calls.length, before, "passive events and refresh add no requests");
+    const fileDoc = JSON.parse(readFileSync(filePath, "utf8"));
+    assert.deepEqual(fileDoc.sources["claude-agent"], doc.sources["claude-agent"]);
+    assert.ok(!JSON.stringify(doc).includes("private text"));
+    await cleanup();
+    cleanup = undefined;
+    assert.equal(host.eventsAborted, true);
+  } finally {
+    await cleanup?.();
+    restoreEnv();
+  }
 });
 
 describe("plugin wiring: credentialed status flow", () => {

@@ -10,7 +10,7 @@ test("initial snapshot is all-unknown and schema-complete", () => {
   const snap = initialSnapshot(new Date("2026-09-26T12:00:00Z"));
   assert.equal(snap.schemaVersion, SCHEMA_VERSION);
   assert.equal(snap.updatedAt, "2026-09-26T12:00:00.000Z");
-  for (const source of [snap.sources.go, snap.sources.codex, snap.sources.cursor]) {
+  for (const source of Object.values(snap.sources)) {
     assert.equal(source.availability, "unknown");
     assert.equal(source.authenticated, false);
     assert.equal(source.stale, true);

@@ -53,6 +53,7 @@ function engineFake(overrides: Partial<Record<SourceId, Partial<SourceStatus>>> 
         go: source(overrides.go),
         codex: source(overrides.codex),
         cursor: source(overrides.cursor),
+        "claude-agent": source(overrides["claude-agent"]),
       },
       models: { go: { "kimi-k3": { ...ESTIMATE } } },
     }),
@@ -145,17 +146,17 @@ describe("status handler", () => {
     const handler = createStatusHandler({ provider, now: () => nowMs });
 
     await handler({ refresh: true });
-    assert.deepEqual(refreshed, ["go", "codex", "cursor"]);
+    assert.deepEqual(refreshed, ["go", "codex", "cursor", "claude-agent"]);
 
     nowMs += 10_000;
     await handler({ refresh: true });
-    assert.equal(refreshed.length, 3, "within the 60s window no further refresh");
+    assert.equal(refreshed.length, 4, "within the 60s window no further refresh");
 
     await handler({});
-    assert.equal(refreshed.length, 3, "cached reads never refresh");
+    assert.equal(refreshed.length, 4, "cached reads never refresh");
 
     nowMs += 61_000;
     await handler({ refresh: true });
-    assert.equal(refreshed.length, 6, "after the window a refresh is allowed again");
+    assert.equal(refreshed.length, 8, "after the window a refresh is allowed again");
   });
 });

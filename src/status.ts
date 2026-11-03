@@ -43,9 +43,9 @@ import type {
   UsageWindow,
 } from "./types.ts";
 
-export type SourceId = "go" | "codex" | "cursor";
+export type SourceId = "go" | "codex" | "cursor" | "claude-agent";
 
-const SOURCE_IDS: readonly SourceId[] = ["go", "codex", "cursor"];
+const SOURCE_IDS: readonly SourceId[] = ["go", "codex", "cursor", "claude-agent"];
 
 /** Durable key for the last snapshot (success or last-known on failure). */
 export const SNAPSHOT_KEY = "status/snapshot";
@@ -125,7 +125,7 @@ function trackCursorResetDays(
     if (resetDay === undefined) return window;
     return { ...window, resetDay, resetsAt: nextMonthlyReset(checkedAt, resetDay), resetEstimated: true };
   });
-  return { ...fresh, windows, availability: deriveAvailability(windows) };
+  return { ...fresh, windows, availability: deriveAvailability(windows, fresh.plan) };
 }
 
 export class StatusEngine {
@@ -147,12 +147,12 @@ export class StatusEngine {
     const entry = (id: SourceId): CacheEntry => ({
       status: this.providers[id]
         ? unknownSource(id)
-        : unknownSource(id, { error: "source not configured" }),
+        : unknownSource(id, { error: id === "claude-agent" ? "waiting for Claude Agent rate-limit metadata" : "source not configured" }),
       checkedAtMs: null,
       attemptedAtMs: null,
       verified: false,
     });
-    this.entries = { go: entry("go"), codex: entry("codex"), cursor: entry("cursor") };
+    this.entries = { go: entry("go"), codex: entry("codex"), cursor: entry("cursor"), "claude-agent": entry("claude-agent") };
   }
 
   /** Load the last persisted snapshot into the cache. Idempotent. */
@@ -189,10 +189,21 @@ export class StatusEngine {
     return this.poll(id, true);
   }
 
+  /** Passive source: only a real event advances its observation clock; refresh never probes. */
+  async observe(id: "claude-agent", status: SourceStatus): Promise<void> {
+    const at = status.checkedAt === null ? NaN : Date.parse(status.checkedAt);
+    const e = this.entries[id];
+    if (!Number.isFinite(at) || at > this.now() || (e.checkedAtMs !== null && at <= e.checkedAtMs)) return;
+    e.status = status;
+    e.checkedAtMs = at;
+    e.verified = true;
+    await this.persist();
+  }
+
   /** All sources in one pass (may trigger coalesced polls for stale ones). */
   readAll(): Promise<Record<SourceId, SourceStatus>> {
     return Promise.all(SOURCE_IDS.map((id) => this.poll(id, false))).then(
-      ([go, codex, cursor]) => ({ go, codex, cursor }),
+      ([go, codex, cursor, claude]) => ({ go, codex, cursor, "claude-agent": claude }),
     );
   }
 
@@ -221,6 +232,7 @@ export class StatusEngine {
         go: this.cached("go"),
         codex: this.cached("codex"),
         cursor: this.cached("cursor"),
+        "claude-agent": this.cached("claude-agent"),
       },
       models: { go: models },
     };
@@ -228,7 +240,9 @@ export class StatusEngine {
 
   private cached(id: SourceId): StatusSnapshotSource {
     const e = this.entries[id];
-    const stale = this.isStale(e);
+    const stale = this.isStale(e) || (id === "claude-agent" && e.status.windows.some(
+      (window) => window.resetsAt !== null && Date.parse(window.resetsAt) <= this.now(),
+    ));
     // Stale data must never imply a current available or exhausted pool.
     return {
       ...e.status,
@@ -286,7 +300,7 @@ export class StatusEngine {
         const observed = id === "cursor"
           ? trackCursorResetDays(e.status, fresh, this.cursorResetAt, e.verified)
           : fresh;
-        e.status = { ...observed, stale: false, availability: deriveAvailability(observed.windows) };
+        e.status = { ...observed, stale: false, availability: deriveAvailability(observed.windows, observed.plan) };
         e.checkedAtMs = Date.parse(fresh.checkedAt);
         e.verified = true;
       } else {

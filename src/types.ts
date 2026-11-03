@@ -37,12 +37,12 @@ export type UsageWindow =
       resetEstimated: true;
     });
 
-/** Normalized quota snapshot for one source (go | codex | cursor). */
+/** Normalized quota snapshot for one source. */
 // ponytail: extends Record<string, JsonValue> — see UsageWindow note.
 export interface SourceStatus extends Record<string, JsonValue> {
-  /** Whether a credential was found for this source. */
+  /** Whether a credential was found, or an authenticated Claude quota event was observed. */
   authenticated: boolean;
-  /** ISO-8601 time of the last successful poll. */
+  /** ISO-8601 time of the last successful poll or provider observation. */
   checkedAt: string | null;
   /** True when data is older than the freshness bound and should not be trusted as current. */
   stale: boolean;
@@ -100,6 +100,7 @@ export interface StatusSnapshot extends Record<string, JsonValue> {
     go: StatusSnapshotSource;
     codex: StatusSnapshotSource;
     cursor: StatusSnapshotSource;
+    "claude-agent": StatusSnapshotSource;
   };
   /** Estimated per-model contribution for Go models. Estimates, not quotas. */
   models: {
@@ -109,7 +110,7 @@ export interface StatusSnapshot extends Record<string, JsonValue> {
 
 /** A provider adapter normalizes raw endpoint data into a SourceStatus. */
 export interface QuotaSource {
-  id: "go" | "codex" | "cursor";
+  id: "go" | "codex" | "cursor" | "claude-agent";
   /** Fetch and normalize. Must not throw on auth/network errors — return an unknown SourceStatus instead. */
   fetch(): Promise<SourceStatus>;
 }
@@ -141,8 +142,13 @@ export function unknownSource(id: string, opts?: { error?: string; authenticated
   };
 }
 
-/** Derive availability from windows: any rate-limited window => limited; no windows => unknown. */
-export function deriveAvailability(windows: UsageWindow[]): Availability {
+/**
+ * Derive availability from windows: any rate-limited window => limited; no windows => unknown.
+ * A source that reports a free plan has no paid pool to spend, so 0% windows do not mean
+ * available: nothing resets it, only a plan change does.
+ */
+export function deriveAvailability(windows: UsageWindow[], plan?: string | null): Availability {
+  if (plan?.trim().toLowerCase() === "free") return "limited";
   if (windows.length === 0) return "unknown";
   if (windows.some((w) => w.state === "rate-limited")) return "limited";
   if (windows.every((w) => w.state === "ok")) return "available";

@@ -1,6 +1,6 @@
 # OpenCode Usage
 
-OpenCode V2 plugin that exposes account quota status for **OpenCode Go**, **Codex (ChatGPT)** and **Cursor** — usage windows, reset times and account-wide availability — through a read-only RPC and a local JSON file.
+OpenCode V2 plugin that exposes quota status for **OpenCode Go**, **Codex (ChatGPT)**, **Cursor**, and the built-in **Claude Agent** — usage windows, reset times and availability — through a read-only RPC and a local JSON file. Claude Agent is event-driven; the other sources are polled.
 
 For OpenCode Go it additionally attributes observed model usage to the **shared, account-wide** Go limits as clearly-labeled **estimates** (observed tokens × published docs pricing). Provider-reported percentages are always authoritative; estimates are never official per-model caps.
 
@@ -47,6 +47,7 @@ Precedence: plugin option `filePath` → `$GO_MODEL_USAGE_FILE` → `<project di
 | OpenCode Go | OpenCode's SQLite credential DB, integration `opencode-go` (type `key`); legacy `auth.json` in the data dir as fallback |
 | Codex | Same DB: OAuth credential for integration `openai`, `codex` or `chatgpt` (first match wins); `metadata.accountID` is sent as `ChatGPT-Account-Id` when present |
 | Cursor | `$CURSOR_TOKEN` / `$CURSOR_REFRESH_TOKEN` env vars → `$CURSOR_TOKEN_FILE` / `$CURSOR_REFRESH_TOKEN_FILE` token files → OpenChamber's managed `quota/cursor.json` (`$OPENCHAMBER_DATA_DIR`, default `~/.config/openchamber`) → this plugin's managed storage. A 401 refreshes once and retries. No macOS `state.vscdb` dependency (Windows-safe) |
+| Claude Agent | No credential access: observes quota metadata from normal built-in `claude-agent` steps. Claude Code owns login and networking. Not the third-party `opencode-claude` plugin. |
 
 DB location: `$OPENCODE_DATA` (default `~/.local/share/opencode`), file `opencode.db`; `$OPENCODE_DB` overrides the file path (relative paths resolve against the data dir). OpenChamber's Cursor credential file is read-only. Any rotated Cursor token is cached only in this plugin's storage; the cache is reused while the OpenChamber file's modification time is unchanged, and replaced when that file changes. When a source has no credential the plugin still starts and reports `credential not found` / `unknown` for it — it never sends a request without a credential.
 
@@ -78,6 +79,17 @@ const fresh = await usage.status({ refresh: true }); // one rate-limited (60 s) 
 From another plugin: `await ctx.rpc(USAGE_RPC).status({})`. OpenChamber agents/tools can read the RPC or the JSON file — no native widget is provided or promised.
 
 ## Freshness and reset semantics
+
+### Claude Agent (passive)
+
+- `sources["claude-agent"]` is always present. It starts `unknown` with `waiting for Claude Agent rate-limit metadata`; `authenticated: true` means a quota event was observed, not that login was separately checked.
+- Reads public `session.step.started` / `ended` / `failed` events, correlates the `claude-agent` provider, and retains only sanitized `native.rateLimit` (older hosts: `providerState.rateLimit`). No CLI process, inference probe, transcript read, credential read, or Anthropic quota request is added.
+- Requires an OpenCode version that forwards the Agent SDK's `rate_limit_event` into step metadata. Older hosts, API-key accounts, or turns without that metadata may remain unknown. A successful turn alone does not imply zero usage.
+- Reports **only the latest observed window**, named by the SDK (`five_hour`, `seven_day`, model-specific weekly, or `overage`; `reported` if unnamed). Missing utilization/reset stays `null`; utilization fractions become percentages. It does not invent or retain a simultaneous 5-hour/weekly dashboard.
+- `allowed` / `allowed_warning` means the observed window is `ok`; `rejected` means its quota is `rate-limited`. If extra usage is reported usable, a rejection is `unknown` rather than claiming all Claude requests are blocked. Model-specific limits are not proof that every model is unavailable.
+- Poll ticks, RPC reads, and manual refresh **never advance Claude's `checkedAt`**. Its last observation is persisted across reloads, but becomes stale/unknown after 5 minutes **or its reported reset**, whichever comes first. A reset is not proof of recovery; a new real event is required.
+
+### Polled sources
 
 - **~60 s poll cache** shared by every reader (RPC, file, other agents/tools). N concurrent reads coalesce into exactly one upstream fetch; a single background interval drives the loop.
 - **Rechecks while capped:** a rate-limited window does not stop polling. The next cache interval rechecks the usage endpoint, so a reset that arrives before the reported `resetsAt` is observed. Availability still comes from the windows that poll returns, so a monthly cap stays limited after a shorter window clears.
@@ -129,6 +141,16 @@ From another plugin: `await ctx.rpc(USAGE_RPC).status({})`. OpenChamber agents/t
       ],
       "availability": "available",
       "nextAvailableAt": null
+    },
+    "claude-agent": {
+      "authenticated": false,
+      "checkedAt": null,
+      "stale": true,
+      "error": "waiting for Claude Agent rate-limit metadata",
+      "windows": [],
+      "availability": "unknown",
+      "plan": null,
+      "nextAvailableAt": null
     }
   },
   "models": {
@@ -146,7 +168,7 @@ From another plugin: `await ctx.rpc(USAGE_RPC).status({})`. OpenChamber agents/t
 }
 ```
 
-`availability` is account-wide: `limited` when any window is `rate-limited`, `available` when all windows are fresh and `ok`, otherwise `unknown`.
+`availability` describes the reported quota windows: `limited` when any window is `rate-limited` **or the provider reports a free plan** (`plan: "Free"` — the metered bars do not entitle paid models, so 0% is not availability), `available` when all windows are fresh and `ok`, otherwise `unknown`. Claude's latest observed window is not an account-wide entitlement check.
 `nextAvailableAt` is the latest reset among rate-limited windows (when all their future reset times are known); it is `null` when not limited or not safely inferable. It can remain known even when the source data is stale.
 
 ## Accuracy limits (read before relying on this)

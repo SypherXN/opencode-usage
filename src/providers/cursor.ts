@@ -208,14 +208,15 @@ export function cursorProvider(opts: CursorProviderOptions = {}): { id: "cursor"
         return unknownSource("cursor", { authenticated: true, error: "usage data could not be parsed" });
       }
 
+      const plan = await planName(accessToken);
       return {
         authenticated: true,
         checkedAt: new Date(now()).toISOString(),
         stale: false,
         error: null,
         windows,
-        availability: deriveAvailability(windows),
-        plan: await planName(accessToken),
+        availability: deriveAvailability(windows, plan),
+        plan,
       };
     },
   };

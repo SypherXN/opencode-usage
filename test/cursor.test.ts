@@ -313,6 +313,7 @@ describe("cursorProvider.fetch", () => {
     const provider = cursorProvider({ accessToken: "tok", fetchImpl });
     const result = await provider.fetch();
     assert.equal(result.plan, "Free");
+    assert.equal(result.availability, "limited");
     assert.equal(calls[1].url, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo");
     assert.equal(calls[1].init?.body, "{}");
   });

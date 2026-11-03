@@ -23,6 +23,7 @@ import { StatusFilePublisher } from "./file.ts";
 import { codexProvider } from "./providers/codex.ts";
 import { goProvider } from "./providers/go.ts";
 import { cursorProvider } from "./providers/cursor.ts";
+import { ClaudeAgentObserver } from "./providers/claude-agent.ts";
 import { createStatusHandler, USAGE_RPC } from "./rpc.ts";
 import { StatusEngine } from "./status.ts";
 import {
@@ -56,6 +57,9 @@ export interface PluginRuntimeCtx {
   location: { directory: string };
   options: Record<string, unknown>;
   storage: StorageLike;
+  event: {
+    subscribe(options: { signal: AbortSignal }): AsyncIterable<unknown>;
+  };
   rpc: {
     register(definition: unknown, handlers: Record<string, unknown>): Promise<RegistrationLike>;
   };
@@ -97,7 +101,7 @@ export function initialSnapshot(now: Date = new Date()): StatusSnapshot {
   return {
     schemaVersion: SCHEMA_VERSION,
     updatedAt: now.toISOString(),
-    sources: { go: unknownSource, codex: unknownSource, cursor: unknownSource },
+    sources: { go: unknownSource, codex: unknownSource, cursor: unknownSource, "claude-agent": unknownSource },
     models: { go: {} },
   };
 }
@@ -177,6 +181,8 @@ export async function createRuntime(
   };
 
   const registrations: RegistrationLike[] = [];
+  const events = new AbortController();
+  const claude = new ClaudeAgentObserver();
 
   // Read-only RPC (cached reads; rate-limited manual refresh).
   const statusHandler = createStatusHandler({ provider: engine, refreshEveryMs: ttlMs, now });
@@ -212,6 +218,18 @@ export async function createRuntime(
     ),
   );
 
+  // Claude's CLI owns HTTP. Observe public step metadata instead of an HTTP hook.
+  // Only sanitized quota fields are retained; stream failures age into unknown.
+  void (async () => {
+    for await (const event of ctx.event.subscribe({ signal: events.signal })) {
+      if (events.signal.aborted) break;
+      const status = claude.observe(event);
+      if (!status) continue;
+      await engine.observe("claude-agent", status);
+      if (!events.signal.aborted) await tick();
+    }
+  })().catch(() => {}); // unavailable/older hosts leave Claude unknown, never available
+
   // The interval is the ONLY timer we own. Overlapping ticks can never double-
   // poll: the engine coalesces in-flight polls and gates each source on its own
   // cache age. The tick is shorter than the cache TTL so an unhealthy source
@@ -225,6 +243,7 @@ export async function createRuntime(
 
   return async () => {
     clearInterval(timer);
+    events.abort();
     for (const reg of registrations) {
       await reg.dispose().catch(() => {});
     }
