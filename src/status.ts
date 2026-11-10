@@ -198,6 +198,9 @@ export class StatusEngine {
     const at = status.checkedAt === null ? NaN : Date.parse(status.checkedAt);
     const e = this.entries[id];
     if (!Number.isFinite(at) || at > this.now() || (e.checkedAtMs !== null && at <= e.checkedAtMs)) return;
+    // An event without utilizations (e.g. a bare rate_limit_event) must not erase
+    // percentages a polled reading already established. Only age may expire them.
+    if (status.windows.every((w) => w.usedPercent === null) && e.status.windows.some((w) => w.usedPercent !== null)) return;
     e.status = status;
     e.checkedAtMs = at;
     e.verified = true;

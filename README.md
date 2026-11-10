@@ -1,12 +1,12 @@
 # OpenCode Usage
 
-OpenCode V2 plugin that exposes quota status for **OpenCode Go**, **Codex (ChatGPT)**, **Cursor**, and the built-in **Claude Agent** — usage windows, reset times and availability — through a read-only RPC and a local JSON file. Claude Agent is event-driven; the other sources are polled.
+OpenCode V2 plugin that exposes quota status for **OpenCode Go**, **Codex (ChatGPT)**, **Cursor**, and the built-in **Claude Agent** - usage windows, reset times and availability - through a read-only RPC and a local JSON file. All four are polled; Claude Agent falls back to observing step events when it has no login of its own.
 
 For OpenCode Go it additionally attributes observed model usage to the **shared, account-wide** Go limits as clearly-labeled **estimates** (observed tokens × published docs pricing). Provider-reported percentages are always authoritative; estimates are never official per-model caps.
 
 ## Guarantees
 
-- **Read-only.** Only usage endpoints are polled. Nothing is ever inferred, no model switching, no fallback resets, no quota-consuming probes.
+- **Read-only by default.** Only usage endpoints are polled. Nothing is inferred, no model switching, no fallback resets. The one exception is the explicit `claudeProbe` opt-in below (at most one output token per 3 minutes; input tokens also count).
 - **Safe failures.** Missing credentials or auth/network errors report `unknown` with a safe message — never a false `available` or `limited`. Secrets never appear in logs, errors or the status document.
 - OpenCode's credential database is read **strictly read-only**; nothing is ever written to it.
 - **No OpenChamber UI widget.** Consumers (agents, tools, scripts) read the RPC or the JSON file.
@@ -25,7 +25,8 @@ Add the package to `plugins` in `opencode.json(c)` (project-local or global at `
       // Relative paths resolve from the config file that contains the entry.
       "package": "./opencode-usage",
       "options": {
-        "filePath": "C:/path/to/opencode-usage.json" // optional; see below
+        "filePath": "C:/path/to/opencode-usage.json", // optional; see below
+        "claudeProbe": false // optional; see "Claude inference probe"
       }
     }
   ]
@@ -47,7 +48,7 @@ Precedence: plugin option `filePath` → `$GO_MODEL_USAGE_FILE` → `<project di
 | OpenCode Go | OpenCode's SQLite credential DB, integration `opencode-go` (type `key`); legacy `auth.json` in the data dir as fallback |
 | Codex | Same DB: OAuth credential for integration `openai`, `codex` or `chatgpt` (first match wins); `metadata.accountID` is sent as `ChatGPT-Account-Id` when present |
 | Cursor | `$CURSOR_TOKEN` / `$CURSOR_REFRESH_TOKEN` env vars → `$CURSOR_TOKEN_FILE` / `$CURSOR_REFRESH_TOKEN_FILE` token files → OpenChamber's managed `quota/cursor.json` (`$OPENCHAMBER_DATA_DIR`, default `~/.config/openchamber`) → this plugin's managed storage. A 401 refreshes once and retries. No macOS `state.vscdb` dependency (Windows-safe) |
-| Claude Agent | No credential access: observes quota metadata from normal built-in `claude-agent` steps. Claude Code owns login and networking. Not the third-party `opencode-claude` plugin. |
+| Claude Agent | Default: Claude Code's `/login` credential `<$CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json` (`claudeAiOauth.accessToken`, re-read every poll) is polled read-only. Opt-in `claudeProbe`: only `$CLAUDE_CODE_OAUTH_TOKEN` (a long-lived `claude setup-token`) is used, against `/v1/messages`, never the `/login` file. Falls back to observing `claude-agent` step metadata when neither path is active. Not the third-party `opencode-claude` plugin. |
 
 DB location: `$OPENCODE_DATA` (default `~/.local/share/opencode`), file `opencode.db`; `$OPENCODE_DB` overrides the file path (relative paths resolve against the data dir). OpenChamber's Cursor credential file is read-only. Any rotated Cursor token is cached only in this plugin's storage; the cache is reused while the OpenChamber file's modification time is unchanged, and replaced when that file changes. When a source has no credential the plugin still starts and reports `credential not found` / `unknown` for it — it never sends a request without a credential.
 
@@ -80,14 +81,33 @@ From another plugin: `await ctx.rpc(USAGE_RPC).status({})`. OpenChamber agents/t
 
 ## Freshness and reset semantics
 
-### Claude Agent (passive)
+### Claude inference probe (opt-in, consumes plan quota)
 
-- `sources["claude-agent"]` is always present. It starts `unknown` with `waiting for Claude Agent rate-limit metadata`; `authenticated: true` means a quota event was observed, not that login was separately checked.
-- Reads public `session.step.started` / `ended` / `failed` events, correlates the `claude-agent` provider, and retains only sanitized `native.rateLimit` (older hosts: `providerState.rateLimit`). No CLI process, inference probe, transcript read, credential read, or Anthropic quota request is added.
-- Requires an OpenCode version that forwards the Agent SDK's `rate_limit_event` into step metadata. Older hosts, API-key accounts, or turns without that metadata may remain unknown. A successful turn alone does not imply zero usage.
-- Reports **only the latest observed window**, named by the SDK (`five_hour`, `seven_day`, model-specific weekly, or `overage`; `reported` if unnamed). Missing utilization/reset stays `null`; utilization fractions become percentages. It does not invent or retain a simultaneous 5-hour/weekly dashboard.
+Set the plugin option `"claudeProbe": true` (and have `$CLAUDE_CODE_OAUTH_TOKEN` set) to read Claude's unified 5h/7d limits from the response headers of a minimal inference call:
+
+- `POST https://api.anthropic.com/v1/messages` with `model: "claude-haiku-5-5"`, `max_tokens: 1`, one `.` message. `max_tokens: 1` means **at most one output token**; input tokens also count, so a probe consumes a small amount of plan quota (roughly 10 input + up to 1 output token). A failed request may consume no output token, but it is not a free usage read.
+- At most once every 3 minutes, shared across restarts and parallel sessions through a separate probe gate file in the temp directory (holds no secrets). Manual refresh cannot bypass it. A `429` waits at least the normal 3-minute cadence; a longer `Retry-After` is honoured up to 24 hours; without a usable `Retry-After` it waits 5 minutes.
+- The env token is the only credential used. The `/login` file is **not read** in probe mode, and the read-only `/api/oauth/usage` endpoint is not called. Without an env token at startup, registration stays passive (step events) as before.
+- Only response headers are parsed: `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset,status}`. Missing or invalid headers stay `null`/`unknown` (never 0%). No model fallback, retries, User-Agent spoofing, or response-body/account data read.
+- Probe mode makes its polled numeric quota authoritative, so a later passive step event does not overwrite it. OpenCode reloads watched config automatically, so toggling `claudeProbe` applies on reload. A changed inherited `$CLAUDE_CODE_OAUTH_TOKEN` needs a process restart, because an existing process keeps its original environment.
+
+### Claude credential modes
+
+Anthropic API keys, Bedrock/Vertex/Foundry env and `apiKeyHelper` are ignored in both modes: they cannot authorize these endpoints.
+
+**Default mode (`claudeProbe` off):** only Claude Code's `/login` credential is polled. `$CLAUDE_CODE_OAUTH_TOKEN` is **not** sent to the usage endpoint, even when set: a setup-token lacks `user:profile` and only draws `403`/`429` there. With no valid `/login` file, Claude stays on the passive step-event path.
+
+- Credential: `<$CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json` -> `claudeAiOauth.accessToken`, re-read every poll and skipped once `claudeAiOauth.expiresAt` has passed. Never logged or persisted.
+- Polled every 3 minutes (`GET https://api.anthropic.com/api/oauth/usage`, same endpoint and cadence OpenChamber's usage tab uses; undocumented and may change). Read-only, does not consume model quota. Windows: `5h`, `7d`, plus `7d_opus` / `7d_sonnet` when present.
+- A `429` pauses polling for `Retry-After` (minimum 5 minutes, maximum 24 hours); other failures pause 60 seconds. The pause and the cadence are shared across processes through a gate file in the temp directory, which holds no secrets. A rejected file token pauses the poll; it never falls back to the env token on this endpoint.
+
+**Probe mode (`claudeProbe: true`):** only `$CLAUDE_CODE_OAUTH_TOKEN` is used, as described in [Claude inference probe](#claude-inference-probe-opt-in-consumes-plan-quota). The `/login` file is not read and `/api/oauth/usage` is not called. Without an env token at startup, this mode also stays passive.
+
+**Fallback in both modes:**
+- **Passive fallback:** with no polled credential (and no active probe), it reads public `session.step.started` / `ended` / `failed` events, correlates the `claude-agent` provider, and retains only sanitized `native.rateLimit` (older hosts: `providerState.rateLimit`). No CLI process or transcript read is added; the only inference probe is the opt-in above.
+- The passive path requires an OpenCode version that forwards the Agent SDK's `rate_limit_event` into step metadata, and reports **only the latest observed window**, named by the SDK (`five_hour`, `seven_day`, model-specific weekly, or `overage`; `reported` if unnamed). Missing utilization/reset stays `null`.
 - `allowed` / `allowed_warning` means the observed window is `ok`; `rejected` means its quota is `rate-limited`. If extra usage is reported usable, a rejection is `unknown` rather than claiming all Claude requests are blocked. Model-specific limits are not proof that every model is unavailable.
-- Poll ticks, RPC reads, and manual refresh **never advance Claude's `checkedAt`**. Its last observation is persisted across reloads, but becomes stale/unknown after 5 minutes **or its reported reset**, whichever comes first. A reset is not proof of recovery; a new real event is required.
+- On the passive fallback only, poll ticks, RPC reads, and manual refresh **never advance Claude's `checkedAt`**. Its last observation is persisted across reloads, but becomes stale/unknown after 5 minutes **or its reported reset**, whichever comes first. A reset is not proof of recovery; a new real event is required.
 
 ### Polled sources
 

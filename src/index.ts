@@ -14,6 +14,7 @@
 // - Starts fine without any credential (all sources "unknown", no requests).
 // - Cleanup on unload stops the interval and disposes RPC/hook registrations.
 
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { Plugin } from "@opencode/plugin";
 import { GoAttribution, type DenialErrorLike } from "./attribution.ts";
@@ -25,7 +26,7 @@ import { goProvider } from "./providers/go.ts";
 import { cursorProvider } from "./providers/cursor.ts";
 import { ClaudeAgentObserver } from "./providers/claude-agent.ts";
 import { CLAUDE_POLL_MS, claudeProvider } from "./providers/claude.ts";
-import { resolveClaudeToken } from "./claude-auth.ts";
+import { resolveClaudeAuths } from "./claude-auth.ts";
 import { createStatusHandler, USAGE_RPC } from "./rpc.ts";
 import { StatusEngine } from "./status.ts";
 import {
@@ -86,6 +87,12 @@ export interface RuntimeDeps {
   cursorResetAt?: string;
   /** Cache TTL / background interval (ms). Defaults to POLL_CACHE_MS (~60s). */
   ttlMs?: number;
+  /** Opt-in Claude inference probe (consumes a little plan quota). Default false. */
+  claudeProbe?: boolean;
+  /** Isolated probe gate file (tests). Default: <tmp>/opencode-usage-claude-probe-gate.json. */
+  claudeProbeStateFile?: string;
+  /** Isolated /login usage gate file (tests). Default: <tmp>/opencode-usage-claude-gate.json. */
+  claudeStateFile?: string;
 }
 
 /** Initial all-unknown snapshot — what the plugin reports before any credential is found. */
@@ -120,6 +127,10 @@ export async function createRuntime(
   const fetchImpl = deps.fetchImpl ?? fetch;
   const ttlMs = deps.ttlMs ?? POLL_CACHE_MS;
   const storage = ctx.storage;
+  const claudeProbe = deps.claudeProbe === true;
+  // Probe mode is env-only and must not touch the /login credential file.
+  const claudeProbeToken = claudeProbe ? process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() : undefined;
+  const claudeProbeActive = claudeProbe && !!claudeProbeToken;
 
   // Credentials (read-only; values never leave these closures).
   const found = loadCredentials();
@@ -152,11 +163,39 @@ export async function createRuntime(
       now,
     }),
     // Claude Code's login token is re-read per poll (it rotates); never stored.
-    // Registered only when a login exists at startup; otherwise the passive
-    // step-event path stays the sole (and unpolled) source.
-    ...(resolveClaudeToken(now())
-      ? { "claude-agent": claudeProvider({ resolveToken: () => resolveClaudeToken(now()), fetchImpl, now }) }
-      : {}),
+    // Probe mode is an explicit opt-in: a tiny env-token inference call reads
+    // the unified rate-limit headers. Otherwise the read-only usage endpoint
+    // requires `user:profile`, so only the /login token is polled and the env
+    // setup-token can never be sent there.
+    ...(claudeProbe
+      ? (claudeProbeToken
+          ? {
+              "claude-agent": claudeProvider({
+                probe: true,
+                resolveAuths: () => {
+                  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
+                  return token ? [{ token, source: "env" as const }] : [];
+                },
+                fetchImpl,
+                now,
+                probeStateFile:
+                  deps.claudeProbeStateFile ??
+                  path.join(tmpdir(), "opencode-usage-claude-probe-gate.json"),
+              }),
+            }
+          : {})
+      : (resolveClaudeAuths(now()).some((a) => a.source === "file")
+          ? {
+              "claude-agent": claudeProvider({
+                resolveAuths: () => resolveClaudeAuths(now()).filter((a) => a.source === "file"),
+                fetchImpl,
+                now,
+                stateFile:
+                  deps.claudeStateFile ??
+                  path.join(tmpdir(), "opencode-usage-claude-gate.json"),
+              }),
+            }
+          : {})),
   };
 
   // Engine (single owner of polling) + Go attribution (estimates only).
@@ -231,9 +270,12 @@ export async function createRuntime(
 
   // Claude's CLI owns HTTP. Observe public step metadata instead of an HTTP hook.
   // Only sanitized quota fields are retained; stream failures age into unknown.
+  // In probe mode the polled numeric quota is authoritative: a single passive
+  // window must not overwrite it. Without an env token, probe mode stays passive.
   void (async () => {
     for await (const event of ctx.event.subscribe({ signal: events.signal })) {
       if (events.signal.aborted) break;
+      if (claudeProbeActive) continue;
       const status = claude.observe(event);
       if (!status) continue;
       await engine.observe("claude-agent", status);
@@ -269,6 +311,7 @@ export default Plugin.define({
     return createRuntime(ctx as unknown as PluginRuntimeCtx, {
       filePath: typeof optFile === "string" && optFile.length > 0 ? optFile : undefined,
       cursorResetAt: typeof cursorResetAt === "string" ? cursorResetAt : undefined,
+      claudeProbe: ctx.options?.claudeProbe === true,
     });
   },
 });
