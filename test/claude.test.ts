@@ -1,17 +1,19 @@
 ﻿import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { StatusEngine } from "../src/status.ts";
 import { resolveClaudeAuth, resolveClaudeToken } from "../src/claude-auth.ts";
+import { CLAUDE_POLL_MS, CLAUDE_PROBE_MS, claudeProvider, parseClaudeUsage } from "../src/providers/claude.ts";
 import {
-  CLAUDE_POLL_MS,
-  CLAUDE_PROBE_MS,
-  claudeProvider,
-  parseClaudeProbeHeaders,
-  parseClaudeUsage,
-} from "../src/providers/claude.ts";
+  CLAUDE_PROBE_ERRORS,
+  runClaudeProbe,
+  type ClaudeProbeOutcome,
+  type ClaudeProbeSpawn,
+} from "../src/providers/claude-cli.ts";
 
 const T0 = Date.parse("2026-11-03T12:00:00Z");
 const PAYLOAD = {
@@ -22,6 +24,47 @@ const PAYLOAD = {
 };
 const reply = (status: number, body: unknown = PAYLOAD) =>
   (async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch;
+
+interface FakeChild extends EventEmitter {
+  stdout: PassThrough;
+  stderr: PassThrough;
+  kill(): boolean;
+}
+
+/** A fake child process: all output is scripted, nothing is spawned. */
+function fakeSpawn(script: (child: FakeChild, close: (code: number | null) => void) => void): ClaudeProbeSpawn {
+  return ((_cmd: string, _args: readonly string[], _opts: unknown) => {
+    const child = new EventEmitter() as FakeChild;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    let closed = false;
+    const close = (code: number | null): void => {
+      if (closed) return;
+      closed = true;
+      child.emit("close", code);
+    };
+    child.kill = () => {
+      close(null);
+      return true;
+    };
+    queueMicrotask(() => script(child, close));
+    return child as unknown as ReturnType<ClaudeProbeSpawn>;
+  }) as ClaudeProbeSpawn;
+}
+
+const rateFrame = (five: unknown, seven: unknown): string => JSON.stringify({
+  type: "rate_limit_event",
+  rate_limit_info: { unifiedWindows: { five_hour: five, seven_day: seven } },
+});
+const resultFrame = (isError = false): string => JSON.stringify({
+  type: "result", is_error: isError, subtype: isError ? "error_during_execution" : "success",
+});
+const probeOk = (): Promise<ClaudeProbeOutcome> => Promise.resolve({
+  windows: [
+    { name: "5h", usedPercent: 0, state: "ok", resetsAt: null },
+    { name: "7d", usedPercent: 6, state: "ok", resetsAt: null },
+  ],
+});
 
 test("parses windows, clamps, skips null/invalid entries", () => {
   const w = parseClaudeUsage(PAYLOAD);
@@ -39,12 +82,14 @@ test("provider: no credential, no request", async () => {
 });
 
 test("provider: probe is off by default, so only the read-only usage endpoint is called", async () => {
-  let url = "";
+  let url = ""; let cliRuns = 0;
   await claudeProvider({
     resolveAuth: () => ({ token: "env", source: "env" }),
     fetchImpl: (async (u: unknown) => { url = String(u); return new Response(JSON.stringify(PAYLOAD)); }) as typeof fetch,
+    runProbe: async () => { cliRuns++; return probeOk(); },
   }).fetch();
   assert.equal(url, "https://api.anthropic.com/api/oauth/usage");
+  assert.equal(cliRuns, 0, "no CLI invocation without the opt-in");
 });
 
 test("provider: success sends bearer + beta header and reports limited", async () => {
@@ -148,6 +193,50 @@ test("engine: Claude uses its own slower TTL", async () => {
   t += 61_000;
   await engine.read("claude-agent");
   assert.equal(calls, 2);
+});
+
+test("engine: a provider 429 and its cooldown keep the last reading but report unknown availability", async () => {
+  // Both probe windows are under 100%, so re-deriving availability would wrongly say "available".
+  let t = T0;
+  let calls = 0;
+  let rateLimited = false;
+  const engine = new StatusEngine({
+    providers: {
+      "claude-agent": claudeProvider({
+        probe: true,
+        resolveAuth: () => ({ token: "env", source: "env" }),
+        now: () => t,
+        runProbe: async () => {
+          calls++;
+          return rateLimited ? { error: CLAUDE_PROBE_ERRORS.exit } : probeOk();
+        },
+      }),
+    },
+    now: () => t,
+    ttlMs: 60_000,
+    sourceTtlMs: { "claude-agent": CLAUDE_POLL_MS },
+  });
+
+  const first = await engine.read("claude-agent");
+  assert.equal(first.availability, "available");
+  assert.equal(calls, 1);
+
+  t += CLAUDE_POLL_MS;
+  rateLimited = true;
+  const failed = await engine.read("claude-agent");
+  assert.equal(calls, 2);
+  assert.equal(failed.availability, "unknown", "a 429 must not re-derive availability");
+  assert.deepEqual(failed.windows, first.windows, "the last numeric windows are retained");
+  assert.equal(failed.checkedAt, first.checkedAt);
+  assert.equal(failed.error, CLAUDE_PROBE_ERRORS.exit);
+
+  t += 15_000;
+  const cooled = await engine.read("claude-agent");
+  assert.equal(calls, 2, "the provider cooldown serves the cache without another request");
+  assert.equal(cooled.availability, "unknown");
+  assert.deepEqual(cooled.windows, first.windows);
+  assert.equal(cooled.checkedAt, first.checkedAt);
+  assert.match(cooled.error ?? "", /paused after a failed request/);
 });
 
 test("engine: a passive event without utilization cannot erase a polled percentage", async () => {
@@ -264,74 +353,46 @@ test("a present CLAUDE_CODE_OAUTH_TOKEN never yields a stale/unknown status", as
   }
 });
 
-const PROBE_HEADERS = {
-  "anthropic-ratelimit-unified-5h-utilization": "0.65",
-  "anthropic-ratelimit-unified-5h-reset": "1783180800",
-  "anthropic-ratelimit-unified-5h-status": "allowed",
-  "anthropic-ratelimit-unified-7d-utilization": "1",
-  "anthropic-ratelimit-unified-7d-reset": "1783713600",
-  "anthropic-ratelimit-unified-7d-status": "allowed_warning",
-};
-const probeReply = (headers: Record<string, string> = PROBE_HEADERS): Response => new Response("", { headers });
-
-test("probe headers: fractions to percent; missing/invalid values stay null/unknown", () => {
-  const windows = parseClaudeProbeHeaders(new Headers(PROBE_HEADERS));
-  assert.deepEqual(windows.map((w) => [w.name, w.usedPercent, w.state]), [["5h", 65, "ok"], ["7d", 100, "ok"]]);
-  assert.equal(windows[0].resetsAt, new Date(1783180800 * 1000).toISOString());
-  const odd = parseClaudeProbeHeaders(new Headers({
-    "anthropic-ratelimit-unified-5h-utilization": "2",
-    "anthropic-ratelimit-unified-5h-status": "allowed",
-    "anthropic-ratelimit-unified-7d-utilization": "bad",
-    "anthropic-ratelimit-unified-7d-status": "rejected",
-    "anthropic-ratelimit-unified-overage-status": "allowed",
-  }));
-  assert.deepEqual(odd.map((w) => [w.name, w.usedPercent, w.state]), [["5h", null, "ok"], ["7d", null, "unknown"]]);
-  assert.deepEqual(parseClaudeProbeHeaders(new Headers()), []);
-});
-
-test("probe: env-only POST /v1/messages with the exact body and no client spoofing", async () => {
-  let url = ""; let init: RequestInit | undefined;
+test("probe: the official client receives only the env token; file-only credentials invoke nothing", async () => {
+  let seen: string | undefined;
   const p = claudeProvider({
     probe: true,
     resolveAuths: () => [{ token: "file-token", source: "file" }, { token: "env-token", source: "env" }],
     now: () => T0,
-    fetchImpl: (async (u: unknown, i: RequestInit) => { url = String(u); init = i; return probeReply(); }) as typeof fetch,
+    runProbe: async (token) => {
+      seen = token;
+      return probeOk();
+    },
   });
   const s = await p.fetch();
-  assert.equal(url, "https://api.anthropic.com/v1/messages");
-  assert.equal(init?.method, "POST");
-  const h = init?.headers as Record<string, string>;
-  assert.equal(h.Authorization, "Bearer env-token", "probe mode never sends the file token");
-  assert.equal(h["anthropic-beta"], "oauth-2025-04-20");
-  assert.equal(h["anthropic-version"], "2023-06-01");
-  assert.equal(h["content-type"], "application/json");
-  assert.equal(h["User-Agent"], undefined);
-  assert.deepEqual(JSON.parse(String(init?.body)), {
-    model: "claude-haiku-5-5", max_tokens: 1, messages: [{ role: "user", content: "." }],
-  });
+  assert.equal(seen, "env-token", "probe mode never uses the file token");
   assert.equal(s.authenticated, true);
   assert.equal(s.availability, "available");
   assert.ok(!JSON.stringify(s).includes("env-token"));
-});
 
-test("probe: file-only credential sends no request", async () => {
   let calls = 0;
-  const s = await claudeProvider({
+  const fileOnly = await claudeProvider({
     probe: true,
     resolveAuths: () => [{ token: "file", source: "file" }],
-    fetchImpl: (async () => { calls++; return probeReply(); }) as unknown as typeof fetch,
+    runProbe: async () => {
+      calls++;
+      return probeOk();
+    },
   }).fetch();
   assert.equal(calls, 0);
-  assert.equal(s.checkedAt, null);
+  assert.equal(fileOnly.checkedAt, null);
 });
 
-test("probe: in-memory cadence blocks manual repeated calls even without a gate file", async () => {
+test("probe: in-memory cadence blocks manual repeated CLI runs", async () => {
   let t = T0; let calls = 0;
   const p = claudeProvider({
     probe: true,
     resolveAuths: () => [{ token: "env", source: "env" }],
     now: () => t,
-    fetchImpl: (async () => { calls++; return probeReply(); }) as unknown as typeof fetch,
+    runProbe: async () => {
+      calls++;
+      return probeOk();
+    },
   });
   const first = await p.fetch();
   const second = await p.fetch();
@@ -345,41 +406,38 @@ test("probe: in-memory cadence blocks manual repeated calls even without a gate 
   assert.equal(calls, 2);
 });
 
-test("probe: network failures and 429s never retry faster than the cadence", async () => {
-  let t = T0; let calls = 0; let mode: "throw" | "429" = "throw";
-  const fetchImpl = (async () => {
-    calls++;
-    if (mode === "throw") throw new Error("offline");
-    return new Response("", { status: 429, headers: { "retry-after": "600" } });
-  }) as unknown as typeof fetch;
-  const p = claudeProvider({ probe: true, resolveAuths: () => [{ token: "env", source: "env" }], now: () => t, fetchImpl });
+test("probe: CLI failures never retry faster than the cadence", async () => {
+  let t = T0; let calls = 0; let fail = true;
+  const p = claudeProvider({
+    probe: true,
+    resolveAuths: () => [{ token: "env", source: "env" }],
+    now: () => t,
+    runProbe: async () => {
+      calls++;
+      if (fail) throw new Error("offline");
+      return probeOk();
+    },
+  });
   assert.equal((await p.fetch()).checkedAt, null);
   t += 15_000;
   await p.fetch();
   assert.equal(calls, 1, "a failed probe is not retried by the 15s unhealthy path");
-  t += CLAUDE_PROBE_MS;
-  mode = "429";
-  assert.match((await p.fetch()).error ?? "", /429/);
-  assert.equal(calls, 2);
-  t += 4 * 60_000;
+  fail = false;
+  t += CLAUDE_PROBE_MS - 15_000;
   await p.fetch();
-  assert.equal(calls, 2, "429 Retry-After is longer than the normal cadence");
-  t += 6 * 60_000 + 1_000;
-  await p.fetch();
-  assert.equal(calls, 3);
+  assert.equal(calls, 2, "the next run waits the full 3 min failure cooldown");
 });
 
-test("probe: a failure after success keeps the cached read stale with a generic error", async () => {
+test("probe: a CLI failure after success keeps the cached read stale with a canned error", async () => {
   let t = T0; let calls = 0; let fail = false;
   const p = claudeProvider({
     probe: true,
     resolveAuths: () => [{ token: "env", source: "env" }],
     now: () => t,
-    fetchImpl: (async () => {
+    runProbe: async () => {
       calls++;
-      if (fail) throw new Error("offline");
-      return probeReply();
-    }) as unknown as typeof fetch,
+      return fail ? { error: CLAUDE_PROBE_ERRORS.timeout } : probeOk();
+    },
   });
   const first = await p.fetch();
   assert.equal(first.windows.length, 2);
@@ -396,13 +454,13 @@ test("probe: a failure after success keeps the cached read stale with a generic 
   assert.equal(cached.windows.length, 2, "the last good probe reading is retained");
 });
 
-test("probe: the gate is reserved before the request, so a crash cannot allow a second probe", async () => {
+test("probe: the gate is reserved before the CLI run, so a crash cannot allow a second probe", async () => {
   const file = path.join(mkdtempSync(path.join(tmpdir(), "claude-probe-")), "gate.json");
-  let calls = 0; let releaseFetch: ((r: Response) => void) | undefined;
-  const pending = new Promise<Response>((resolve) => { releaseFetch = resolve; });
+  let calls = 0; let releaseProbe: (() => void) | undefined;
+  const pending = new Promise<ClaudeProbeOutcome>((resolve) => { releaseProbe = () => resolve(probeOk()); });
   const a = claudeProvider({
     probe: true, resolveAuths: () => [{ token: "env", source: "env" }],
-    fetchImpl: (async () => { calls++; return pending; }) as unknown as typeof fetch,
+    runProbe: async () => { calls++; return pending; },
     now: () => T0, probeStateFile: file,
   });
   const inFlight = a.fetch();
@@ -417,32 +475,31 @@ test("probe: the gate is reserved before the request, so a crash cannot allow a 
   let secondCalls = 0;
   const b = claudeProvider({
     probe: true, resolveAuths: () => [{ token: "env", source: "env" }],
-    fetchImpl: (async () => { secondCalls++; return probeReply(); }) as unknown as typeof fetch,
+    runProbe: async () => { secondCalls++; return probeOk(); },
     now: () => T0 + 60_000, probeStateFile: file,
   });
   const blocked = await b.fetch();
-  assert.equal(secondCalls, 0, "a recreated provider sends no request inside the reserved window");
+  assert.equal(secondCalls, 0, "a recreated provider runs no CLI inside the reserved window");
   assert.equal(blocked.checkedAt, null);
 
-  releaseFetch!(probeReply());
+  releaseProbe!();
   assert.equal((await inFlight).windows.length, 2);
 });
 
 test("probe: shared gate and in-flight lock cover restarts and parallel instances", async () => {
   const file = path.join(mkdtempSync(path.join(tmpdir(), "claude-probe-")), "gate.json");
-  let calls = 0; let releaseFetch: ((r: Response) => void) | undefined;
-  const pending = new Promise<Response>((resolve) => { releaseFetch = resolve; });
-  const fetchImpl = (async () => { calls++; return pending; }) as unknown as typeof fetch;
+  let calls = 0; let releaseProbe: (() => void) | undefined;
+  const pending = new Promise<ClaudeProbeOutcome>((resolve) => { releaseProbe = () => resolve(probeOk()); });
   const make = (at: number) => claudeProvider({
     probe: true, resolveAuths: () => [{ token: "env", source: "env" }],
-    fetchImpl, now: () => at, probeStateFile: file,
+    runProbe: async () => { calls++; return pending; }, now: () => at, probeStateFile: file,
   });
   const a = make(T0).fetch();
   await new Promise((r) => setTimeout(r, 20)); // let instance A take the lock
   const b = await make(T0).fetch();
   assert.equal(calls, 1, "a parallel instance cannot probe");
   assert.equal(b.checkedAt, null);
-  releaseFetch!(probeReply());
+  releaseProbe!();
   const first = await a;
   assert.equal(first.windows.length, 2);
   const restarted = await make(T0).fetch();
@@ -450,4 +507,231 @@ test("probe: shared gate and in-flight lock cover restarts and parallel instance
   assert.equal(restarted.checkedAt, first.checkedAt);
   await make(T0 + CLAUDE_PROBE_MS + 1).fetch();
   assert.equal(calls, 2);
+});
+
+test("probe: the canned CLI failure survives the cooldown, a repeated read and a restart on the same gate", async () => {
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "claude-probe-")), "gate.json");
+  let t = T0;
+  let calls = 0;
+  const make = (at: number) => claudeProvider({
+    probe: true, resolveAuths: () => [{ token: "env", source: "env" }],
+    runProbe: async () => { calls++; return { error: CLAUDE_PROBE_ERRORS.timeout }; },
+    now: () => at, probeStateFile: file,
+  });
+  const p = make(T0);
+  const first = await p.fetch();
+  assert.equal(first.error, CLAUDE_PROBE_ERRORS.timeout);
+  assert.equal(calls, 1);
+  // Same instance, inside the cooldown: keep the cause instead of the generic text.
+  t += 15_000;
+  const repeated = await p.fetch();
+  assert.match(repeated.error ?? "", /paused \(probe CLI timed out\), retry in \d+ min/);
+  // A restart on the same gate keeps it too, without another request.
+  const restarted = await make(T0 + 30_000).fetch();
+  assert.match(restarted.error ?? "", /probe CLI timed out/);
+  assert.equal(calls, 1, "no extra probe");
+});
+
+test("probe: only canned CLI errors are served from the gate, never an arbitrary stored string", async () => {
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "claude-probe-")), "gate.json");
+  let calls = 0;
+  const read = (at: number) => claudeProvider({
+    probe: true, resolveAuths: () => [{ token: "env", source: "env" }],
+    runProbe: async () => { calls++; return probeOk(); },
+    now: () => at, probeStateFile: file,
+  }).fetch();
+  // Older gates carry no cause: fall back to the generic paused text.
+  writeFileSync(file, JSON.stringify({ nextAllowedAt: T0 + 60_000, reason: "cooldown" }));
+  assert.match((await read(T0)).error ?? "", /^Claude probe paused, retry in 1 min$/);
+  // A tampered gate must not echo its contents back to the caller.
+  writeFileSync(file, JSON.stringify({ nextAllowedAt: T0 + 60_000, reason: "cooldown", error: "token sk-live-123" }));
+  const tampered = await read(T0);
+  assert.doesNotMatch(tampered.error ?? "", /sk-live|token/);
+  assert.match(tampered.error ?? "", /^Claude probe paused, retry in 1 min$/);
+  // A forged cause token is rejected the same way.
+  writeFileSync(file, JSON.stringify({
+    nextAllowedAt: T0 + 60_000, reason: "cooldown",
+    error: "probe CLI timed out [cause=sk-live]",
+  }));
+  const forged = await read(T0);
+  assert.doesNotMatch(forged.error ?? "", /sk-live/);
+  assert.match(forged.error ?? "", /^Claude probe paused, retry in 1 min$/);
+  // A real canned CLI error survives a restart.
+  writeFileSync(file, JSON.stringify({
+    nextAllowedAt: T0 + 60_000, reason: "cooldown", error: CLAUDE_PROBE_ERRORS.output,
+  }));
+  assert.ok((await read(T0)).error?.includes(CLAUDE_PROBE_ERRORS.output));
+  assert.equal(calls, 0, "the gate short-circuits before any CLI run");
+});
+
+test("probe: an unwritable reservation or corrupt gate fails closed without running the CLI", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "claude-gate-"));
+  const unwritable = path.join(dir, "unwritable.json");
+  writeFileSync(unwritable, JSON.stringify({ nextAllowedAt: 0, reason: "cadence" }));
+  chmodSync(unwritable, 0o444);
+  let runs = 0;
+  const p = claudeProvider({
+    probe: true,
+    resolveAuths: () => [{ token: "env", source: "env" }],
+    runProbe: async () => { runs++; return probeOk(); },
+    now: () => T0,
+    probeStateFile: unwritable,
+  });
+  const failed = await p.fetch();
+  assert.equal(runs, 0, "no CLI run when the reservation cannot be persisted");
+  assert.equal(failed.checkedAt, null);
+  assert.equal(failed.error, "probe gate file is unwritable");
+  // The in-memory cadence still holds, so a retry cannot spend inside 3 minutes.
+  await p.fetch();
+  assert.equal(runs, 0);
+
+  const corrupt = path.join(dir, "corrupt.json");
+  writeFileSync(corrupt, "{not json");
+  let corruptRuns = 0;
+  const c = claudeProvider({
+    probe: true,
+    resolveAuths: () => [{ token: "env", source: "env" }],
+    runProbe: async () => { corruptRuns++; return probeOk(); },
+    now: () => T0,
+    probeStateFile: corrupt,
+  });
+  assert.equal((await c.fetch()).error, "probe gate file is invalid");
+  assert.equal(corruptRuns, 0);
+  assert.equal(readFileSync(corrupt, "utf8"), "{not json", "the corrupt gate is not replaced");
+
+  // Valid JSON with an invalid cached status is treated the same way.
+  const tampered = path.join(dir, "tampered.json");
+  writeFileSync(tampered, JSON.stringify({ nextAllowedAt: 0, reason: "cadence", status: { windows: "no" } }));
+  let tamperedRuns = 0;
+  const t = claudeProvider({
+    probe: true,
+    resolveAuths: () => [{ token: "env", source: "env" }],
+    runProbe: async () => { tamperedRuns++; return probeOk(); },
+    now: () => T0,
+    probeStateFile: tampered,
+  });
+  assert.equal((await t.fetch()).error, "probe gate file is invalid");
+  assert.equal(tamperedRuns, 0);
+
+  chmodSync(unwritable, 0o666);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("probe: CLI numeric frames become 5h/7d percentages; missing resets stay null", async () => {
+  const outcome = await runClaudeProbe({
+    token: "token",
+    tempRoot: mkdtempSync(path.join(tmpdir(), "claude-run-")),
+    spawnImpl: fakeSpawn((child, close) => {
+      child.stdout.write(rateFrame(
+        { status: "allowed", utilization: 0 },
+        { status: "allowed", utilization: 0.06 },
+      ) + "\n");
+      child.stdout.write(resultFrame() + "\n");
+      child.stdout.end();
+      close(0);
+    }),
+  });
+  assert.deepEqual("windows" in outcome && outcome.windows.map((w) => [w.name, w.usedPercent, w.state, w.resetsAt]), [
+    ["5h", 0, "ok", null],
+    ["7d", 6, "ok", null],
+  ]);
+});
+
+test("probe: no CLI quota data, malformed output, non-zero exit and timeouts fail closed", async () => {
+  const run = (script: (child: FakeChild, close: (code: number | null) => void) => void, timeoutMs?: number) =>
+    runClaudeProbe({
+      token: "secret-token",
+      tempRoot: mkdtempSync(path.join(tmpdir(), "claude-run-")),
+      spawnImpl: fakeSpawn(script),
+      timeoutMs,
+    });
+
+  assert.deepEqual(await run((child, close) => { child.stdout.end(); close(0); }), {
+    error: CLAUDE_PROBE_ERRORS.noData,
+  });
+  assert.deepEqual(await run((child, close) => {
+    child.stdout.write("not json secret-token\n"); child.stdout.end(); close(0);
+  }), { error: CLAUDE_PROBE_ERRORS.noData });
+  assert.deepEqual(await run((child, close) => { child.stdout.end(); close(2); }), {
+    error: CLAUDE_PROBE_ERRORS.exit,
+  });
+  const timedOut = await run(() => { /* never closes */ }, 20);
+  assert.deepEqual(timedOut, { error: CLAUDE_PROBE_ERRORS.timeout });
+  assert.ok(!JSON.stringify(timedOut).includes("secret-token"));
+});
+
+test("probe: oversized CLI output is bounded and fails closed", async () => {
+  const outcome = await runClaudeProbe({
+    token: "secret-token",
+    tempRoot: mkdtempSync(path.join(tmpdir(), "claude-run-")),
+    timeoutMs: 100,
+    spawnImpl: fakeSpawn((child) => {
+      child.stdout.write("x".repeat(1024 * 1024 + 1));
+    }),
+  });
+  assert.deepEqual(outcome, { error: CLAUDE_PROBE_ERRORS.output });
+});
+
+test("probe: CLI env/args are isolated, sanitized and carry the token only in the child env", async () => {
+  const saved: Record<string, string | undefined> = {};
+  const hostile = {
+    ANTHROPIC_API_KEY: "secret-api-key",
+    CLAUDE_CODE_USE_BEDROCK: "1",
+    CLAUDECODE: "1",
+    CLAUDE_CODE_SIMPLE: "1",
+    CLAUDE_CODE_EXTRA_BODY: "secret-body",
+    CLAUDE_CODE_BASE_URL: "https://evil.example",
+    CLAUDE_CODE_OAUTH_TOKEN: "old-token",
+  };
+  for (const [k, v] of Object.entries(hostile)) { saved[k] = process.env[k]; process.env[k] = v; }
+  try {
+    let command = ""; let args: readonly string[] = []; let options: unknown;
+    const root = mkdtempSync(path.join(tmpdir(), "claude-root-"));
+    const outcome = await runClaudeProbe({
+      token: "new-token",
+      tempRoot: root,
+      spawnImpl: ((cmd: string, argv: readonly string[], opts: unknown) => {
+        command = cmd; args = argv; options = opts;
+        const child = new EventEmitter() as FakeChild;
+        child.stdout = new PassThrough(); child.stderr = new PassThrough();
+        child.kill = () => false;
+        queueMicrotask(() => {
+          child.stdout.write(rateFrame({ status: "allowed", utilization: 0.5 }, { status: "allowed", utilization: 0.5 }) + "\n");
+          child.stdout.end(); child.emit("close", 0);
+        });
+        return child as unknown as ReturnType<ClaudeProbeSpawn>;
+      }) as ClaudeProbeSpawn,
+    });
+    assert.ok("windows" in outcome);
+    assert.equal(command, process.platform === "win32" ? "claude.exe" : "claude");
+    assert.deepEqual(args, [
+      "-p", "Reply with OK only.", "--model", "claude-haiku-5-5", "--safe-mode",
+      "--no-session-persistence", "--output-format", "stream-json", "--verbose",
+      "--max-turns", "1", "--tools", "", "--permission-prompts", "none",
+      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+      "--settings", '{"disableAllHooks":true}',
+    ]);
+    const o = options as { cwd: string; env: Record<string, string>; shell: boolean; stdio: string[] };
+    assert.equal(o.shell, false, "no shell quoting/injection");
+    assert.deepEqual(o.stdio, ["ignore", "pipe", "pipe"]);
+    assert.equal(o.env.CLAUDE_CODE_OAUTH_TOKEN, "new-token");
+    assert.equal(o.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "16");
+    assert.equal(o.env.CLAUDE_CODE_MAX_RETRIES, "0");
+    assert.equal(o.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
+    assert.equal(o.env.ANTHROPIC_API_KEY, undefined);
+    assert.equal(o.env.CLAUDE_CODE_USE_BEDROCK, undefined);
+    assert.equal(o.env.CLAUDECODE, undefined);
+    assert.equal(o.env.CLAUDE_CODE_SIMPLE, undefined);
+    assert.equal(o.env.CLAUDE_CODE_EXTRA_BODY, undefined);
+    assert.equal(o.env.CLAUDE_CODE_BASE_URL, undefined);
+    assert.equal(o.env.CLAUDE_CONFIG_DIR, path.join(o.cwd, "config"));
+    assert.ok(path.resolve(o.cwd).startsWith(path.resolve(root)));
+    assert.equal(existsSync(o.cwd), false, "scratch dir removed after the subprocess");
+    assert.ok(!JSON.stringify(args).includes("new-token"), "token never appears in argv");
+    assert.ok(!JSON.stringify(outcome).includes("new-token"));
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
 });

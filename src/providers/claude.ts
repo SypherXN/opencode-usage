@@ -10,14 +10,21 @@ import path from "node:path";
 import type { ClaudeAuth, ClaudeTokenSource } from "../claude-auth.ts";
 import type { SourceStatus, UsageWindow } from "../types.ts";
 import { deriveAvailability, unknownSource } from "../types.ts";
+import {
+  CLAUDE_PROBE_ERRORS,
+  CLAUDE_PROBE_TIMEOUT_MS,
+  runClaudeProbe,
+  type ClaudeProbeOutcome,
+} from "./claude-cli.ts";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
-const PROBE_URL = "https://api.anthropic.com/v1/messages";
-const PROBE_MODEL = "claude-haiku-5-5";
 const TIMEOUT_MS = 15_000;
 /** Matches OpenChamber's usage-tab cadence (3 min) so the two share the token's budget. */
 export const CLAUDE_POLL_MS = 3 * 60_000;
-/** Minimum gap between opt-in inference probes. Input tokens count; output is capped at 1. */
+/**
+ * Minimum gap between opt-in official-client probes. Input/system/cache tokens
+ * count; output is only requested as 16 tokens, not guaranteed as a cap.
+ */
 export const CLAUDE_PROBE_MS = 3 * 60_000;
 const RATE_LIMIT_COOLDOWN_MS = 5 * 60_000; // OpenChamber's default; Retry-After may extend it
 const MAX_COOLDOWN_MS = 24 * 60 * 60_000;
@@ -47,45 +54,6 @@ export function parseClaudeUsage(payload: unknown): UsageWindow[] {
   return windows;
 }
 
-function headerFraction(value: string | null): number | null {
-  if (value === null || value.trim() === "") return null;
-  const n = Number(value);
-  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : null;
-}
-
-function headerUnixSeconds(value: string | null): number | null {
-  if (value === null || value.trim() === "") return null;
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 && n * 1000 <= 8.64e15 ? n : null;
-}
-
-/** Only headers, never the response body/prompt/account data. Missing or malformed fields stay null/unknown. */
-export function parseClaudeProbeHeaders(headers: Headers): UsageWindow[] {
-  const overage = ["allowed", "allowed_warning"].includes(
-    headers.get("anthropic-ratelimit-unified-overage-status") ?? "",
-  ) || headers.get("anthropic-ratelimit-unified-overage-included") === "true";
-  const windows: UsageWindow[] = [];
-  for (const suffix of ["5h", "7d"] as const) {
-    const base = `anthropic-ratelimit-unified-${suffix}`;
-    const utilization = headerFraction(headers.get(`${base}-utilization`));
-    const reset = headerUnixSeconds(headers.get(`${base}-reset`));
-    const rawStatus = headers.get(`${base}-status`);
-    const status = rawStatus === "allowed" || rawStatus === "allowed_warning" || rawStatus === "rejected"
-      ? rawStatus : null;
-    if (utilization === null && reset === null && status === null) continue;
-    const state = status === "rejected"
-      ? (overage ? "unknown" : "rate-limited")
-      : status === "allowed" || status === "allowed_warning" ? "ok" : "unknown";
-    windows.push({
-      name: suffix,
-      usedPercent: utilization === null ? null : utilization * 100,
-      state,
-      resetsAt: reset === null ? null : new Date(reset * 1000).toISOString(),
-    });
-  }
-  return windows;
-}
-
 export interface ClaudeProviderOptions {
   /** Re-reads the token on each fetch (Claude Code rotates it). Source is reported in errors. */
   resolveAuth?: () => ClaudeAuth | null;
@@ -96,17 +64,19 @@ export interface ClaudeProviderOptions {
   /** Shared gate file so restarts and parallel sessions respect one cooldown/poll cadence. Holds no secrets. */
   stateFile?: string;
   /**
-   * Opt-in inference probe: at most one output token per 3 minutes against
-   * /v1/messages using the env setup-token. Input tokens also count, so this
-   * consumes a small amount of plan quota; failed requests may consume none.
+   * Opt-in official-client probe: at most one invocation per 3 minutes using
+   * the env setup-token. The CLI is run with a 16-output-token hint; input,
+   * system and cache tokens still count.
    */
   probe?: boolean;
   /** Probe gate file. Must be distinct from the read-only usage gate. Holds no secrets. */
   probeStateFile?: string;
+  /** Injectable official-client runner. Tests use this; production spawns the CLI. */
+  runProbe?: (token: string) => Promise<ClaudeProbeOutcome>;
 }
 
-/** Cross-process reservation for the probe. Stale after a request timeout. */
-const PROBE_LOCK_STALE_MS = TIMEOUT_MS + 5_000;
+/** Cross-process reservation for the probe. Stale after the CLI deadline. */
+const PROBE_LOCK_STALE_MS = CLAUDE_PROBE_TIMEOUT_MS + 5_000;
 
 function acquireProbeLock(file: string): (() => void) | null {
   try {
@@ -139,8 +109,24 @@ interface SharedState {
   /** Why polling is paused: the normal poll cadence, or a failure/rate-limit cooldown. */
   reason?: "cadence" | "cooldown";
   status?: SourceStatus;
+  /** Canned diagnostic from the last failed probe; never a raw response or header. */
+  error?: string;
   /** A credential this endpoint rejects or throttles so hard it is skipped until then. */
   blocked?: Partial<Record<ClaudeTokenSource, number>>;
+}
+
+/**
+ * Allowlist for the persisted error: only our own fixed messages leave this
+ * process, so a tampered/older gate cannot echo arbitrary text or a secret.
+ */
+const PROBE_GATE_INVALID = "probe gate file is invalid";
+const PROBE_GATE_UNWRITABLE = "probe gate file is unwritable";
+const PROBE_ERROR_BASE =
+  "probe (?:request failed or timed out|CLI failed to launch|CLI timed out|CLI output limit exceeded|CLI exited unsuccessfully|CLI returned no usage data|gate file is invalid|gate file is unwritable|usage headers missing or unparseable)";
+const PROBE_ERROR_RE = new RegExp(`^${PROBE_ERROR_BASE}$`);
+
+function safeProbeError(value: unknown): string | undefined {
+  return typeof value === "string" && PROBE_ERROR_RE.test(value) ? value : undefined;
 }
 
 function loadState(file?: string): SharedState | null {
@@ -153,13 +139,51 @@ function loadState(file?: string): SharedState | null {
   }
 }
 
-function saveState(file: string | undefined, s: SharedState): void {
-  if (!file) return;
+/**
+ * Probe-only load: a missing gate is fresh, but an existing corrupt/invalid
+ * gate must fail closed instead of becoming an empty gate and spending quota.
+ */
+function loadProbeState(file?: string): SharedState | null | "invalid" {
+  if (!file) return null;
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? null : "invalid";
+  }
+  try {
+    const s = JSON.parse(raw) as SharedState;
+    if (typeof s?.nextAllowedAt !== "number" || !Number.isFinite(s.nextAllowedAt)) return "invalid";
+    if (s.reason !== undefined && s.reason !== "cadence" && s.reason !== "cooldown") return "invalid";
+    if (s.status !== undefined && !validProbeStatus(s.status)) return "invalid";
+    return s;
+  } catch {
+    return "invalid";
+  }
+}
+
+function validProbeStatus(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const s = value as Partial<SourceStatus>;
+  if (!Array.isArray(s.windows)) return false;
+  if (s.availability !== "available" && s.availability !== "limited" && s.availability !== "unknown") return false;
+  return s.windows.every((w) => {
+    const window = w as { name?: unknown; usedPercent?: unknown; state?: unknown; resetsAt?: unknown };
+    return typeof window?.name === "string" &&
+      (window.usedPercent === null || (typeof window.usedPercent === "number" && Number.isFinite(window.usedPercent))) &&
+      (window.state === "ok" || window.state === "rate-limited" || window.state === "unknown") &&
+      (window.resetsAt === null || typeof window.resetsAt === "string");
+  });
+}
+
+function saveState(file: string | undefined, s: SharedState): boolean {
+  if (!file) return true;
   try {
     mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, JSON.stringify(s));
+    return true;
   } catch {
-    /* best effort */
+    return false;
   }
 }
 
@@ -171,6 +195,7 @@ export function claudeProvider(opts: ClaudeProviderOptions): { id: "claude-agent
     const one = opts.resolveAuth?.();
     return one ? [one] : [];
   };
+  const runProbe = opts.runProbe ?? ((token: string) => runClaudeProbe({ token }));
   // The endpoint is shared with OpenChamber (same token). After a failure, stay off
   // it: the engine's 15s unhealthy retry would otherwise hammer a limited endpoint.
   let cooldownUntil = 0;
@@ -179,20 +204,25 @@ export function claudeProvider(opts: ClaudeProviderOptions): { id: "claude-agent
   // covers restarts and parallel processes.
   let probeNextAt = 0;
   let probeReason: "cadence" | "cooldown" | undefined;
+  let probeError: string | undefined;
   let probeStatus: SourceStatus | null = null;
   let probing = false;
+
+  const pauseMessage = (cause: string | undefined, mins: number, afterFailure: boolean): string =>
+    `Claude probe paused${afterFailure ? " after a failed request" : ""}${cause ? ` (${cause})` : ""}, retry in ${mins} min`;
 
   const probeWait = (state: SharedState | null): SourceStatus => {
     const gate = Math.max(probeNextAt, state?.nextAllowedAt ?? 0);
     const mins = Math.max(1, Math.round((gate - now()) / 60_000));
     const reason = state?.reason ?? probeReason;
+    const cause = safeProbeError(state?.error) ?? probeError;
     const cached = (state?.status ?? probeStatus) as SourceStatus | undefined;
     if (cached && cached.windows.length > 0) {
       return reason === "cooldown"
-        ? { ...cached, stale: true, error: `Claude probe paused after a failed request, retry in ${mins} min` }
+        ? { ...cached, stale: true, error: pauseMessage(cause, mins, true) }
         : { ...cached };
     }
-    return unknownSource("claude-agent", { authenticated: true, error: `Claude probe paused, retry in ${mins} min` });
+    return unknownSource("claude-agent", { authenticated: true, error: pauseMessage(cause, mins, false) });
   };
 
   const probe = async (auth: ClaudeAuth): Promise<SourceStatus> => {
@@ -202,11 +232,14 @@ export function claudeProvider(opts: ClaudeProviderOptions): { id: "claude-agent
       try {
         mkdirSync(path.dirname(opts.probeStateFile), { recursive: true });
       } catch {
-        /* the save below is best effort too */
+        /* the reservation below fails closed if the path is unusable */
       }
       release = acquireProbeLock(`${opts.probeStateFile}.lock`);
       if (!release) {
-        const shared = loadState(opts.probeStateFile);
+        const shared = loadProbeState(opts.probeStateFile);
+        if (shared === "invalid") {
+          return unknownSource("claude-agent", { authenticated: true, error: PROBE_GATE_INVALID });
+        }
         return shared && now() < shared.nextAllowedAt
           ? probeWait(shared)
           : unknownSource("claude-agent", { authenticated: true, error: "Claude probe already in progress" });
@@ -215,22 +248,29 @@ export function claudeProvider(opts: ClaudeProviderOptions): { id: "claude-agent
     probing = true;
     let state: SharedState = { nextAllowedAt: 0 };
     try {
-      state = loadState(opts.probeStateFile) ?? state;
+      const loaded = loadProbeState(opts.probeStateFile);
+      if (loaded === "invalid") {
+        return unknownSource("claude-agent", { authenticated: true, error: PROBE_GATE_INVALID });
+      }
+      state = loaded ?? state;
       const gate = Math.max(probeNextAt, state.nextAllowedAt ?? 0);
       if (now() < gate) {
         probeNextAt = Math.max(probeNextAt, state.nextAllowedAt ?? 0);
         probeStatus = (state.status as SourceStatus | undefined) ?? probeStatus;
         probeReason = state.reason;
+        probeError = safeProbeError(state.error) ?? probeError;
         return probeWait(state);
       }
-      const commit = (ms: number, reason: "cadence" | "cooldown", fresh?: SourceStatus) => {
+      const commit = (ms: number, reason: "cadence" | "cooldown", fresh?: SourceStatus, cause?: string) => {
         probeNextAt = now() + ms;
         probeReason = reason;
+        probeError = safeProbeError(cause);
         if (fresh) probeStatus = fresh;
         saveState(opts.probeStateFile, {
           nextAllowedAt: probeNextAt,
           reason,
           status: (probeStatus ?? state.status) as SourceStatus | undefined,
+          error: probeError,
         });
       };
       // Reserve and persist the full cadence while still holding the lock, before
@@ -239,59 +279,39 @@ export function claudeProvider(opts: ClaudeProviderOptions): { id: "claude-agent
       const reservedUntil = now() + CLAUDE_PROBE_MS;
       probeNextAt = reservedUntil;
       probeReason = "cadence";
-      saveState(opts.probeStateFile, {
+      probeError = undefined;
+      const reserved = saveState(opts.probeStateFile, {
         nextAllowedAt: reservedUntil,
         reason: "cadence",
         status: (probeStatus ?? state.status) as SourceStatus | undefined,
       });
-      let response: Response;
+      if (!reserved) {
+        // Keep the in-memory cadence, but never spend quota without the shared gate.
+        probeError = PROBE_GATE_UNWRITABLE;
+        return unknownSource("claude-agent", { authenticated: true, error: PROBE_GATE_UNWRITABLE });
+      }
+      let outcome: ClaudeProbeOutcome;
       try {
-        response = await fetchImpl(PROBE_URL, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${auth.token}`,
-            "anthropic-beta": "oauth-2025-04-20",
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({ model: PROBE_MODEL, max_tokens: 1, messages: [{ role: "user", content: "." }] }),
-          signal: AbortSignal.timeout(TIMEOUT_MS),
-        });
+        outcome = await runProbe(auth.token);
       } catch {
-        commit(CLAUDE_PROBE_MS, "cooldown");
-        return unknownSource("claude-agent", { authenticated: true, error: "probe request failed or timed out" });
+        outcome = { error: "probe request failed or timed out" };
       }
-      void response.body?.cancel().catch(() => {}); // headers only; never read the body
-      if (response.status === 401 || response.status === 403) {
-        commit(CLAUDE_PROBE_MS, "cooldown");
-        return unknownSource("claude-agent", { authenticated: true, error: "probe authentication failed (env token rejected)" });
+      if ("error" in outcome) {
+        commit(CLAUDE_PROBE_MS, "cooldown", undefined, outcome.error);
+        return unknownSource("claude-agent", { authenticated: true, error: outcome.error });
       }
-      if (response.status === 429) {
-        const secs = Number(response.headers.get("retry-after"));
-        const asked = Number.isFinite(secs) && secs > 0 ? secs * 1000 : RATE_LIMIT_COOLDOWN_MS;
-        const ms = Math.min(MAX_COOLDOWN_MS, Math.max(CLAUDE_PROBE_MS, asked));
-        commit(ms, "cooldown");
-        return unknownSource("claude-agent", {
-          authenticated: true,
-          error: `probe rate limited (HTTP 429), retry in ${Math.round(ms / 60_000)} min`,
-        });
-      }
-      if (!response.ok) {
-        commit(CLAUDE_PROBE_MS, "cooldown");
-        return unknownSource("claude-agent", { authenticated: true, error: `probe returned HTTP ${response.status}` });
-      }
-      const windows = parseClaudeProbeHeaders(response.headers);
-      if (windows.length === 0) {
-        commit(CLAUDE_PROBE_MS, "cooldown");
-        return unknownSource("claude-agent", { authenticated: true, error: "probe usage headers missing or unparseable" });
+      if (outcome.windows.length === 0) {
+        const error = CLAUDE_PROBE_ERRORS.noData;
+        commit(CLAUDE_PROBE_MS, "cooldown", undefined, error);
+        return unknownSource("claude-agent", { authenticated: true, error });
       }
       const ok: SourceStatus = {
         authenticated: true,
         checkedAt: new Date(now()).toISOString(),
         stale: false,
         error: null,
-        windows,
-        availability: deriveAvailability(windows),
+        windows: outcome.windows,
+        availability: deriveAvailability(outcome.windows),
         plan: null,
       };
       commit(CLAUDE_PROBE_MS, "cadence", ok);

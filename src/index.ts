@@ -26,6 +26,7 @@ import { goProvider } from "./providers/go.ts";
 import { cursorProvider } from "./providers/cursor.ts";
 import { ClaudeAgentObserver } from "./providers/claude-agent.ts";
 import { CLAUDE_POLL_MS, claudeProvider } from "./providers/claude.ts";
+import type { ClaudeProbeOutcome } from "./providers/claude-cli.ts";
 import { resolveClaudeAuths } from "./claude-auth.ts";
 import { createStatusHandler, USAGE_RPC } from "./rpc.ts";
 import { StatusEngine } from "./status.ts";
@@ -87,8 +88,10 @@ export interface RuntimeDeps {
   cursorResetAt?: string;
   /** Cache TTL / background interval (ms). Defaults to POLL_CACHE_MS (~60s). */
   ttlMs?: number;
-  /** Opt-in Claude inference probe (consumes a little plan quota). Default false. */
+  /** Opt-in official-client probe (consumes a little plan quota). Default false. */
   claudeProbe?: boolean;
+  /** Injectable official-client runner. Tests must use this so no CLI is spawned. */
+  claudeProbeRunner?: (token: string) => Promise<ClaudeProbeOutcome>;
   /** Isolated probe gate file (tests). Default: <tmp>/opencode-usage-claude-probe-gate.json. */
   claudeProbeStateFile?: string;
   /** Isolated /login usage gate file (tests). Default: <tmp>/opencode-usage-claude-gate.json. */
@@ -127,7 +130,7 @@ export async function createRuntime(
   const fetchImpl = deps.fetchImpl ?? fetch;
   const ttlMs = deps.ttlMs ?? POLL_CACHE_MS;
   const storage = ctx.storage;
-  const claudeProbe = deps.claudeProbe === true;
+  const claudeProbe = deps.claudeProbe === true || process.env.OPENCODE_USAGE_CLAUDE_PROBE === "1";
   // Probe mode is env-only and must not touch the /login credential file.
   const claudeProbeToken = claudeProbe ? process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() : undefined;
   const claudeProbeActive = claudeProbe && !!claudeProbeToken;
@@ -163,10 +166,10 @@ export async function createRuntime(
       now,
     }),
     // Claude Code's login token is re-read per poll (it rotates); never stored.
-    // Probe mode is an explicit opt-in: a tiny env-token inference call reads
-    // the unified rate-limit headers. Otherwise the read-only usage endpoint
-    // requires `user:profile`, so only the /login token is polled and the env
-    // setup-token can never be sent there.
+    // Probe mode is an explicit opt-in: one env-token official-client run reads
+    // validated quota events. Otherwise the read-only usage endpoint requires
+    // `user:profile`, so only the /login token is polled and the env setup-token
+    // can never be sent there.
     ...(claudeProbe
       ? (claudeProbeToken
           ? {
@@ -178,6 +181,7 @@ export async function createRuntime(
                 },
                 fetchImpl,
                 now,
+                runProbe: deps.claudeProbeRunner,
                 probeStateFile:
                   deps.claudeProbeStateFile ??
                   path.join(tmpdir(), "opencode-usage-claude-probe-gate.json"),

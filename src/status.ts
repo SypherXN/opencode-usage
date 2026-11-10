@@ -303,7 +303,8 @@ export class StatusEngine {
         // Providers must not throw, but stay safe anyway.
         fresh = unknownSource(id, { authenticated: e.status.authenticated, error: "request failed or timed out" });
       }
-      if (fresh.checkedAt) {
+      // A cooldown may return timestamped historical data, not a successful poll.
+      if (fresh.checkedAt && !fresh.stale) {
         // Success — availability is re-derived from ALL reported windows.
         const observed = id === "cursor"
           ? trackCursorResetDays(e.status, fresh, this.cursorResetAt, e.verified)

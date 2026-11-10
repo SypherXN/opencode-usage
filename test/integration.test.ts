@@ -26,16 +26,6 @@ const GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CURSOR_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
-const CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
-
-const CLAUDE_PROBE_HEADERS = {
-  "anthropic-ratelimit-unified-5h-utilization": "0.65",
-  "anthropic-ratelimit-unified-5h-reset": String((T0 + HOUR) / 1000),
-  "anthropic-ratelimit-unified-5h-status": "allowed",
-  "anthropic-ratelimit-unified-7d-utilization": "0.63",
-  "anthropic-ratelimit-unified-7d-reset": String((T0 + 6 * DAY) / 1000),
-  "anthropic-ratelimit-unified-7d-status": "allowed_warning",
-};
 
 /** Healthy account-wide Go windows (rolling/weekly/monthly). */
 const GO_OK_BODY = {
@@ -104,6 +94,7 @@ const ENV_KEYS = [
   "OPENCHAMBER_DATA_DIR",
   "CLAUDE_CONFIG_DIR",
   "CLAUDE_CODE_OAUTH_TOKEN",
+  "OPENCODE_USAGE_CLAUDE_PROBE",
 ];
 
 function scrubEnv(): () => void {
@@ -215,7 +206,6 @@ interface FetchHarness {
 
 interface FetchOptions {
   claudeUsage?: { status?: number; body?: unknown };
-  claudeProbe?: { status?: number; headers?: Record<string, string> };
 }
 
 function makeFetch(goState: GoState, opts: FetchOptions = {}): FetchHarness {
@@ -234,12 +224,6 @@ function makeFetch(goState: GoState, opts: FetchOptions = {}): FetchHarness {
       const status = opts.claudeUsage.status ?? 200;
       return new Response(JSON.stringify(opts.claudeUsage.body ?? {}), { status });
     }
-    if (opts.claudeProbe && url === CLAUDE_MESSAGES_URL) {
-      return new Response("", {
-        status: opts.claudeProbe.status ?? 200,
-        headers: opts.claudeProbe.headers,
-      });
-    }
     return new Response("not found", { status: 404 });
   };
   return { fetchImpl, calls };
@@ -253,6 +237,11 @@ const CLAUDE_USAGE_BODY = {
   five_hour: { utilization: 10, resets_at: iso(T0 + HOUR) },
   seven_day: { utilization: 20, resets_at: iso(T0 + DAY) },
 };
+
+const CLAUDE_CLI_WINDOWS = [
+  { name: "5h", usedPercent: 0, state: "ok" as const, resetsAt: null },
+  { name: "7d", usedPercent: 6, state: "ok" as const, resetsAt: null },
+];
 
 /** An /login credential whose file expiry is past; only the env token can be valid. */
 function writeExpiredClaudeFile(): string {
@@ -608,23 +597,25 @@ describe("plugin wiring: publish isolation", () => {
 });
 
 describe("plugin wiring: Claude probe opt-in", () => {
-  it("is disabled by default: an env token causes no inference request", async () => {
+  it("is disabled by default: an env token causes no CLI run", async () => {
     const restoreEnv = scrubEnv();
     try {
       const dir = freshTmp();
       process.env.OPENCODE_DATA = path.join(dir, "empty-data");
       process.env.CLAUDE_CODE_OAUTH_TOKEN = "env-probe-token";
       writeExpiredClaudeFile();
-      const f = makeFetch({ body: GO_OK_BODY }, { claudeProbe: { headers: CLAUDE_PROBE_HEADERS } });
+      let runs = 0;
+      const f = makeFetch({ body: GO_OK_BODY });
       const { host, cleanup } = await boot(dir, {
         fetchImpl: f.fetchImpl,
         now: () => T0,
         ttlMs: 30,
         filePath: path.join(dir, "usage.json"),
+        claudeProbeRunner: async () => { runs++; return { windows: CLAUDE_CLI_WINDOWS }; },
       });
 
       await settle();
-      assert.equal(callsTo(f, CLAUDE_MESSAGES_URL), 0, "no inference probe without opt-in");
+      assert.equal(runs, 0, "no CLI invocation without opt-in");
       assert.equal(callsTo(f, CLAUDE_USAGE_URL), 0, "an env setup-token is never sent to the read-only endpoint");
       assert.equal((await rpcStatus(host)).sources["claude-agent"].authenticated, false);
       await cleanup();
@@ -633,14 +624,16 @@ describe("plugin wiring: Claude probe opt-in", () => {
     }
   });
 
-  it("uses the env token with an expired /login file and parses only headers", async () => {
+  it("uses the env token with an expired /login file and serves only validated CLI quota", async () => {
     const restoreEnv = scrubEnv();
     try {
       const dir = freshTmp();
       process.env.OPENCODE_DATA = path.join(dir, "empty-data");
       process.env.CLAUDE_CODE_OAUTH_TOKEN = "env-probe-token";
       writeExpiredClaudeFile();
-      const f = makeFetch({ body: GO_OK_BODY }, { claudeProbe: { headers: CLAUDE_PROBE_HEADERS } });
+      let seenToken = "";
+      let runs = 0;
+      const f = makeFetch({ body: GO_OK_BODY });
       const { host, cleanup } = await boot(dir, {
         fetchImpl: f.fetchImpl,
         now: () => T0,
@@ -648,26 +641,21 @@ describe("plugin wiring: Claude probe opt-in", () => {
         filePath: path.join(dir, "usage.json"),
         claudeProbe: true,
         claudeProbeStateFile: path.join(dir, "probe-gate.json"),
+        claudeProbeRunner: async (token) => {
+          runs++; seenToken = token;
+          return { windows: CLAUDE_CLI_WINDOWS };
+        },
       });
 
       await settle();
-      assert.equal(callsTo(f, CLAUDE_MESSAGES_URL), 1, "one opted-in probe at boot");
+      assert.equal(runs, 1, "one opted-in CLI run at boot");
+      assert.equal(seenToken, "env-probe-token", "the expired /login file is never used");
       assert.equal(callsTo(f, CLAUDE_USAGE_URL), 0);
-      const call = f.calls.find((c) => c.url === CLAUDE_MESSAGES_URL)!;
-      const headers = call.init?.headers as Record<string, string>;
-      assert.equal(call.init?.method, "POST");
-      assert.equal(headers.Authorization, "Bearer env-probe-token");
-      assert.equal(headers["anthropic-beta"], "oauth-2025-04-20");
-      assert.equal(headers["anthropic-version"], "2023-06-01");
-      assert.equal(headers["content-type"], "application/json");
-      assert.deepEqual(JSON.parse(String(call.init?.body)), {
-        model: "claude-haiku-5-5", max_tokens: 1, messages: [{ role: "user", content: "." }],
-      });
 
       const doc = await rpcStatus(host);
       assert.deepEqual(
         doc.sources["claude-agent"].windows.map((w) => [w.name, w.usedPercent, w.state]),
-        [["5h", 65, "ok"], ["7d", 63, "ok"]],
+        [["5h", 0, "ok"], ["7d", 6, "ok"]],
       );
       assert.equal(doc.sources["claude-agent"].checkedAt, iso(T0));
       assert.equal(doc.sources["claude-agent"].error, null);
@@ -687,10 +675,46 @@ describe("plugin wiring: Claude probe opt-in", () => {
       const after = await rpcStatus(host, { refresh: true });
       assert.deepEqual(
         after.sources["claude-agent"].windows.map((w) => [w.name, w.usedPercent]),
-        [["5h", 65], ["7d", 63]],
+        [["5h", 0], ["7d", 6]],
       );
-      assert.equal(callsTo(f, CLAUDE_MESSAGES_URL), 1, "a manual refresh cannot bypass the probe cadence");
+      assert.equal(runs, 1, "a manual refresh cannot bypass the probe cadence");
 
+      await cleanup();
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("honors the OPENCODE_USAGE_CLAUDE_PROBE env flag without the plugin option", async () => {
+    const restoreEnv = scrubEnv();
+    try {
+      const dir = freshTmp();
+      process.env.OPENCODE_DATA = path.join(dir, "empty-data");
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = "env-flag-token";
+      process.env.OPENCODE_USAGE_CLAUDE_PROBE = "1";
+      const claudeDir = writeExpiredClaudeFile();
+      let runs = 0;
+      const f = makeFetch({ body: GO_OK_BODY });
+      const { host, cleanup } = await boot(dir, {
+        fetchImpl: f.fetchImpl,
+        now: () => T0,
+        ttlMs: 30,
+        filePath: path.join(dir, "usage.json"),
+        claudeProbeStateFile: path.join(dir, "probe-gate.json"),
+        claudeProbeRunner: async () => { runs++; return { windows: CLAUDE_CLI_WINDOWS }; },
+      });
+
+      await settle();
+      assert.equal(runs, 1, "the env flag alone enables the probe");
+      assert.equal(callsTo(f, CLAUDE_USAGE_URL), 0, "the /login file path is not read in probe mode");
+      assert.ok(existsSync(path.join(claudeDir, ".credentials.json")), "fixture file still exists");
+
+      const source = (await rpcStatus(host)).sources["claude-agent"];
+      assert.deepEqual(
+        source.windows.map((w) => [w.name, w.usedPercent, w.state]),
+        [["5h", 0, "ok"], ["7d", 6, "ok"]],
+      );
+      assert.equal(source.availability, "available");
       await cleanup();
     } finally {
       restoreEnv();
@@ -722,7 +746,6 @@ describe("plugin wiring: Claude probe opt-in", () => {
       const call = f.calls.find((c) => c.url === CLAUDE_USAGE_URL);
       assert.ok(call, "the read-only usage endpoint is polled when a file login exists");
       assert.equal((call.init?.headers as Record<string, string>).Authorization, "Bearer file-token");
-      assert.equal(callsTo(f, CLAUDE_MESSAGES_URL), 0);
       await cleanup();
     } finally {
       restoreEnv();

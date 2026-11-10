@@ -6,7 +6,7 @@ For OpenCode Go it additionally attributes observed model usage to the **shared,
 
 ## Guarantees
 
-- **Read-only by default.** Only usage endpoints are polled. Nothing is inferred, no model switching, no fallback resets. The one exception is the explicit `claudeProbe` opt-in below (at most one output token per 3 minutes; input tokens also count).
+- **Read-only by default.** Only usage endpoints are polled. Nothing is inferred, no model switching, no fallback resets. The one exception is the explicit `claudeProbe` opt-in below (one Claude Code invocation per 3 minutes; input and output tokens count, with no guaranteed one-token cap).
 - **Safe failures.** Missing credentials or auth/network errors report `unknown` with a safe message — never a false `available` or `limited`. Secrets never appear in logs, errors or the status document.
 - OpenCode's credential database is read **strictly read-only**; nothing is ever written to it.
 - **No OpenChamber UI widget.** Consumers (agents, tools, scripts) read the RPC or the JSON file.
@@ -48,7 +48,7 @@ Precedence: plugin option `filePath` → `$GO_MODEL_USAGE_FILE` → `<project di
 | OpenCode Go | OpenCode's SQLite credential DB, integration `opencode-go` (type `key`); legacy `auth.json` in the data dir as fallback |
 | Codex | Same DB: OAuth credential for integration `openai`, `codex` or `chatgpt` (first match wins); `metadata.accountID` is sent as `ChatGPT-Account-Id` when present |
 | Cursor | `$CURSOR_TOKEN` / `$CURSOR_REFRESH_TOKEN` env vars → `$CURSOR_TOKEN_FILE` / `$CURSOR_REFRESH_TOKEN_FILE` token files → OpenChamber's managed `quota/cursor.json` (`$OPENCHAMBER_DATA_DIR`, default `~/.config/openchamber`) → this plugin's managed storage. A 401 refreshes once and retries. No macOS `state.vscdb` dependency (Windows-safe) |
-| Claude Agent | Default: Claude Code's `/login` credential `<$CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json` (`claudeAiOauth.accessToken`, re-read every poll) is polled read-only. Opt-in `claudeProbe`: only `$CLAUDE_CODE_OAUTH_TOKEN` (a long-lived `claude setup-token`) is used, against `/v1/messages`, never the `/login` file. Falls back to observing `claude-agent` step metadata when neither path is active. Not the third-party `opencode-claude` plugin. |
+| Claude Agent | Default: Claude Code's `/login` credential `<$CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json` (`claudeAiOauth.accessToken`, re-read every poll) is polled read-only. Opt-in `claudeProbe`: the installed Claude Code CLI uses only `$CLAUDE_CODE_OAUTH_TOKEN` (a long-lived `claude setup-token`), without a `/login` dependency. Falls back to observing `claude-agent` step metadata when neither path is active. Not the third-party `opencode-claude` plugin. |
 
 DB location: `$OPENCODE_DATA` (default `~/.local/share/opencode`), file `opencode.db`; `$OPENCODE_DB` overrides the file path (relative paths resolve against the data dir). OpenChamber's Cursor credential file is read-only. Any rotated Cursor token is cached only in this plugin's storage; the cache is reused while the OpenChamber file's modification time is unchanged, and replaced when that file changes. When a source has no credential the plugin still starts and reports `credential not found` / `unknown` for it — it never sends a request without a credential.
 
@@ -83,25 +83,25 @@ From another plugin: `await ctx.rpc(USAGE_RPC).status({})`. OpenChamber agents/t
 
 ### Claude inference probe (opt-in, consumes plan quota)
 
-Set the plugin option `"claudeProbe": true` (and have `$CLAUDE_CODE_OAUTH_TOKEN` set) to read Claude's unified 5h/7d limits from the response headers of a minimal inference call:
+Set `OPENCODE_USAGE_CLAUDE_PROBE=1` or the plugin option `"claudeProbe": true` (and have `$CLAUDE_CODE_OAUTH_TOKEN` set) to read Claude's unified 5h/7d limits from the installed Claude Code CLI's quota events. The `claude` executable must be available on PATH. The env flag also works for auto-loaded plugins that have no options object; the token alone does not enable quota-spending probes.
 
-- `POST https://api.anthropic.com/v1/messages` with `model: "claude-haiku-5-5"`, `max_tokens: 1`, one `.` message. `max_tokens: 1` means **at most one output token**; input tokens also count, so a probe consumes a small amount of plan quota (roughly 10 input + up to 1 output token). A failed request may consume no output token, but it is not a free usage read.
-- At most once every 3 minutes, shared across restarts and parallel sessions through a separate probe gate file in the temp directory (holds no secrets). Manual refresh cannot bypass it. A `429` waits at least the normal 3-minute cadence; a longer `Retry-After` is honoured up to 24 hours; without a usable `Retry-After` it waits 5 minutes.
+- One short Claude Code invocation using `claude-haiku-5-5`, with tools, customizations, session persistence and automatic retries disabled, and a 30-second deadline. It requests 16 output tokens, **not a guaranteed output cap**: the client may raise it or make auxiliary requests. Input, system, thinking and cache tokens also count. This replaces the former raw HTTP one-output-token probe, which repeatedly returned 429 while the official client succeeded.
+- At most one invocation every 3 minutes, shared across restarts and parallel sessions through a separate probe gate file in the temp directory (holds no secrets). Manual refresh cannot bypass it. Failures pause subsequent invocations for at least the normal cadence.
 - The env token is the only credential used. The `/login` file is **not read** in probe mode, and the read-only `/api/oauth/usage` endpoint is not called. Without an env token at startup, registration stays passive (step events) as before.
-- Only response headers are parsed: `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset,status}`. Missing or invalid headers stay `null`/`unknown` (never 0%). No model fallback, retries, User-Agent spoofing, or response-body/account data read.
-- Probe mode makes its polled numeric quota authoritative, so a later passive step event does not overwrite it. OpenCode reloads watched config automatically, so toggling `claudeProbe` applies on reload. A changed inherited `$CLAUDE_CODE_OAUTH_TOKEN` needs a process restart, because an existing process keeps its original environment.
+- Only validated quota metadata from `rate_limit_event` frames is retained. Missing or invalid utilization/reset stays `null`/`unknown` (never invented as 0%). Output is bounded; generated text and stderr are not exposed or persisted by the plugin. No model fallback or client impersonation is used.
+- Probe mode makes its polled numeric quota authoritative, so a later passive step event does not overwrite it. OpenCode reloads watched config automatically, so toggling `claudeProbe` applies on reload. Changes to inherited `$CLAUDE_CODE_OAUTH_TOKEN` or `OPENCODE_USAGE_CLAUDE_PROBE` need a process restart, because an existing process keeps its original environment.
 
 ### Claude credential modes
 
-Anthropic API keys, Bedrock/Vertex/Foundry env and `apiKeyHelper` are ignored in both modes: they cannot authorize these endpoints.
+Anthropic API keys and Bedrock/Vertex/Foundry credentials are not used for subscription quota. Probe mode removes competing Anthropic/provider environment variables and uses an isolated temporary config directory so the supplied env OAuth token is authoritative.
 
-**Default mode (`claudeProbe` off):** only Claude Code's `/login` credential is polled. `$CLAUDE_CODE_OAUTH_TOKEN` is **not** sent to the usage endpoint, even when set: a setup-token lacks `user:profile` and only draws `403`/`429` there. With no valid `/login` file, Claude stays on the passive step-event path.
+**Default mode (`claudeProbe` off and `OPENCODE_USAGE_CLAUDE_PROBE` not `1`):** only Claude Code's `/login` credential is polled. `$CLAUDE_CODE_OAUTH_TOKEN` is **not** sent to the usage endpoint, even when set: a setup-token lacks `user:profile` and only draws `403`/`429` there. With no valid `/login` file, Claude stays on the passive step-event path.
 
 - Credential: `<$CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json` -> `claudeAiOauth.accessToken`, re-read every poll and skipped once `claudeAiOauth.expiresAt` has passed. Never logged or persisted.
 - Polled every 3 minutes (`GET https://api.anthropic.com/api/oauth/usage`, same endpoint and cadence OpenChamber's usage tab uses; undocumented and may change). Read-only, does not consume model quota. Windows: `5h`, `7d`, plus `7d_opus` / `7d_sonnet` when present.
 - A `429` pauses polling for `Retry-After` (minimum 5 minutes, maximum 24 hours); other failures pause 60 seconds. The pause and the cadence are shared across processes through a gate file in the temp directory, which holds no secrets. A rejected file token pauses the poll; it never falls back to the env token on this endpoint.
 
-**Probe mode (`claudeProbe: true`):** only `$CLAUDE_CODE_OAUTH_TOKEN` is used, as described in [Claude inference probe](#claude-inference-probe-opt-in-consumes-plan-quota). The `/login` file is not read and `/api/oauth/usage` is not called. Without an env token at startup, this mode also stays passive.
+**Probe mode (`claudeProbe: true` or `OPENCODE_USAGE_CLAUDE_PROBE=1`):** only `$CLAUDE_CODE_OAUTH_TOKEN` is used, as described in [Claude inference probe](#claude-inference-probe-opt-in-consumes-plan-quota). The `/login` file is not read and `/api/oauth/usage` is not called. Without an env token at startup, this mode also stays passive.
 
 **Fallback in both modes:**
 - **Passive fallback:** with no polled credential (and no active probe), it reads public `session.step.started` / `ended` / `failed` events, correlates the `claude-agent` provider, and retains only sanitized `native.rateLimit` (older hosts: `providerState.rateLimit`). No CLI process or transcript read is added; the only inference probe is the opt-in above.
