@@ -43,9 +43,9 @@ import type {
   UsageWindow,
 } from "./types.ts";
 
-export type SourceId = "go" | "codex" | "cursor" | "claude-agent";
+export type SourceId = "go" | "zen" | "codex" | "cursor" | "claude-agent";
 
-const SOURCE_IDS: readonly SourceId[] = ["go", "codex", "cursor", "claude-agent"];
+const SOURCE_IDS: readonly SourceId[] = ["go", "codex", "cursor", "claude-agent", "zen"];
 
 /** Durable key for the last snapshot (success or last-known on failure). */
 export const SNAPSHOT_KEY = "status/snapshot";
@@ -107,7 +107,7 @@ function trackCursorResetDays(
   const checkedAt = Date.parse(fresh.checkedAt!);
   const observedDay = new Date(checkedAt).getUTCDate();
   const initialResetMs = initialResetAt ? Date.parse(initialResetAt) : Number.NaN;
-  const windows = fresh.windows.map((window) => {
+  const windows = fresh.windows.map<UsageWindow>((window) => {
     const prior = previousByName.get(window.name);
     const priorResetDay = prior && typeof prior.resetDay === "number" ? prior.resetDay : undefined;
     const observedDrop = detectDrop && prior?.usedPercent !== null && prior?.usedPercent !== undefined &&
@@ -119,7 +119,6 @@ function trackCursorResetDays(
     if (resetDay === undefined && Number.isFinite(initialResetMs) && initialResetMs > checkedAt) {
       return {
         ...window,
-        ...(resetDay === undefined ? {} : { resetDay }),
         resetsAt: new Date(initialResetMs).toISOString(),
         resetEstimated: true as const,
       };
@@ -156,7 +155,7 @@ export class StatusEngine {
       attemptedAtMs: null,
       verified: false,
     });
-    this.entries = { go: entry("go"), codex: entry("codex"), cursor: entry("cursor"), "claude-agent": entry("claude-agent") };
+    this.entries = { go: entry("go"), zen: entry("zen"), codex: entry("codex"), cursor: entry("cursor"), "claude-agent": entry("claude-agent") };
   }
 
   /** Load the last persisted snapshot into the cache. Idempotent. */
@@ -210,7 +209,7 @@ export class StatusEngine {
   /** All sources in one pass (may trigger coalesced polls for stale ones). */
   readAll(): Promise<Record<SourceId, SourceStatus>> {
     return Promise.all(SOURCE_IDS.map((id) => this.poll(id, false))).then(
-      ([go, codex, cursor, claude]) => ({ go, codex, cursor, "claude-agent": claude }),
+      ([go, codex, cursor, claude, zen]) => ({ go, zen, codex, cursor, "claude-agent": claude }),
     );
   }
 
@@ -237,6 +236,7 @@ export class StatusEngine {
       updatedAt: new Date(this.now()).toISOString(),
       sources: {
         go: this.cached("go"),
+        zen: this.cached("zen"),
         codex: this.cached("codex"),
         cursor: this.cached("cursor"),
         "claude-agent": this.cached("claude-agent"),

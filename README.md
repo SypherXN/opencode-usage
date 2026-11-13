@@ -1,6 +1,6 @@
 # OpenCode Usage
 
-OpenCode V2 plugin that exposes quota status for **OpenCode Go**, **Codex (ChatGPT)**, **Cursor**, and the built-in **Claude Agent** - usage windows, reset times and availability - through a read-only RPC and a local JSON file. All four are polled; Claude Agent falls back to observing step events when it has no login of its own.
+OpenCode V2 plugin that exposes quota status for **OpenCode Go**, **OpenCode Zen**, **Codex (ChatGPT)**, **Cursor**, and the built-in **Claude Agent** through a read-only RPC and a local JSON file. Zen reports remaining prepaid credits in USD; the other sources report usage windows, reset times and availability. Claude Agent falls back to observing step events when it has no login of its own.
 
 For OpenCode Go it additionally attributes observed model usage to the **shared, account-wide** Go limits as clearly-labeled **estimates** (observed tokens × published docs pricing). Provider-reported percentages are always authoritative; estimates are never official per-model caps.
 
@@ -46,6 +46,7 @@ Precedence: plugin option `filePath` → `$GO_MODEL_USAGE_FILE` → `<project di
 | Source | Where credentials come from |
 |---|---|
 | OpenCode Go | OpenCode's SQLite credential DB, integration `opencode-go` (type `key`); legacy `auth.json` in the data dir as fallback |
+| OpenCode Zen | Console OAuth sign-in under integration `opencode`, including its Console server and workspace ID. Re-read each poll to pick up credentials rotated by OpenCode. API keys cannot read the credit balance. |
 | Codex | Same DB: OAuth credential for integration `openai`, `codex` or `chatgpt` (first match wins); `metadata.accountID` is sent as `ChatGPT-Account-Id` when present |
 | Cursor | `$CURSOR_TOKEN` / `$CURSOR_REFRESH_TOKEN` env vars → `$CURSOR_TOKEN_FILE` / `$CURSOR_REFRESH_TOKEN_FILE` token files → OpenChamber's managed `quota/cursor.json` (`$OPENCHAMBER_DATA_DIR`, default `~/.config/openchamber`) → this plugin's managed storage. A 401 refreshes once and retries. No macOS `state.vscdb` dependency (Windows-safe) |
 | Claude Agent | Default: Claude Code's `/login` credential `<$CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json` (`claudeAiOauth.accessToken`, re-read every poll) is polled read-only. Opt-in `claudeProbe`: the installed Claude Code CLI uses only `$CLAUDE_CODE_OAUTH_TOKEN` (a long-lived `claude setup-token`), without a `/login` dependency. Falls back to observing `claude-agent` step metadata when neither path is active. Not the third-party `opencode-claude` plugin. |
@@ -81,13 +82,21 @@ From another plugin: `await ctx.rpc(USAGE_RPC).status({})`. OpenChamber agents/t
 
 ## Freshness and reset semantics
 
+### OpenCode Zen credits
+
+The `zen` source reads `GET https://opencode.ai/console/api/billing/status` using your existing Console OAuth sign-in and workspace ID. This is the same **undocumented** endpoint OpenChamber uses; it may change. It is read-only and makes no model requests. A Go subscription is not required.
+
+Its `credits_balance` window reports `balanceUSD` and `currency: "USD"`, converting the provider's `availableMicroCents` by dividing by 100,000,000. `usedPercent` and `resetsAt` stay `null`: a remaining dollar balance is not a usage percentage or a resetting allowance. Positive credit means `available`; exactly zero means `limited`. Missing credentials, malformed balances and failed requests mean `unknown`, never a fabricated zero. This describes the prepaid pool, not whether free models or auto-recharge are available.
+
+Zen uses the normal ~60-second cache and five-minute freshness bound. The balance appears in both the JSON file and RPC output; no OpenChamber widget is added. Without a valid Console OAuth sign-in it remains `unknown`, even if a Zen or Go API key is present.
+
 ### Claude inference probe (opt-in, consumes plan quota)
 
 Set `OPENCODE_USAGE_CLAUDE_PROBE=1` or the plugin option `"claudeProbe": true` (and have `$CLAUDE_CODE_OAUTH_TOKEN` set) to read Claude's unified 5h/7d limits from the installed Claude Code CLI's quota events. The `claude` executable must be available on PATH. The env flag also works for auto-loaded plugins that have no options object; the token alone does not enable quota-spending probes.
 
 - One short Claude Code invocation using `claude-haiku-5-5`, with tools, customizations, session persistence and automatic retries disabled, and a 30-second deadline. It requests 16 output tokens, **not a guaranteed output cap**: the client may raise it or make auxiliary requests. Input, system, thinking and cache tokens also count. This replaces the former raw HTTP one-output-token probe, which repeatedly returned 429 while the official client succeeded.
 - At most one invocation every 3 minutes, shared across restarts and parallel sessions through a separate probe gate file in the temp directory (holds no secrets). Manual refresh cannot bypass it. Failures pause subsequent invocations for at least the normal cadence.
-- The env token is the only credential used. The `/login` file is **not read** in probe mode, and the read-only `/api/oauth/usage` endpoint is not called. Without an env token at startup, registration stays passive (step events) as before.
+- Login first: if a usable (unexpired) `/login` file exists at startup, it is polled read-only and the probe never runs, even when opted in. The probe is only the fallback when no usable login exists; API errors never switch modes at runtime. If the selected login expires without being refreshed, quota becomes unknown rather than starting paid probes. Startup checks the login file; the probe provider itself uses only the env token and never calls `/api/oauth/usage`. Without a usable login or env token at startup, registration stays passive (step events) as before.
 - Only validated quota metadata from `rate_limit_event` frames is retained. Missing or invalid utilization/reset stays `null`/`unknown` (never invented as 0%). Output is bounded; generated text and stderr are not exposed or persisted by the plugin. No model fallback or client impersonation is used.
 - Probe mode makes its polled numeric quota authoritative, so a later passive step event does not overwrite it. OpenCode reloads watched config automatically, so toggling `claudeProbe` applies on reload. Changes to inherited `$CLAUDE_CODE_OAUTH_TOKEN` or `OPENCODE_USAGE_CLAUDE_PROBE` need a process restart, because an existing process keeps its original environment.
 
@@ -101,7 +110,7 @@ Anthropic API keys and Bedrock/Vertex/Foundry credentials are not used for subsc
 - Polled every 3 minutes (`GET https://api.anthropic.com/api/oauth/usage`, same endpoint and cadence OpenChamber's usage tab uses; undocumented and may change). Read-only, does not consume model quota. Windows: `5h`, `7d`, plus `7d_opus` / `7d_sonnet` when present.
 - A `429` pauses polling for `Retry-After` (minimum 5 minutes, maximum 24 hours); other failures pause 60 seconds. The pause and the cadence are shared across processes through a gate file in the temp directory, which holds no secrets. A rejected file token pauses the poll; it never falls back to the env token on this endpoint.
 
-**Probe mode (`claudeProbe: true` or `OPENCODE_USAGE_CLAUDE_PROBE=1`):** only `$CLAUDE_CODE_OAUTH_TOKEN` is used, as described in [Claude inference probe](#claude-inference-probe-opt-in-consumes-plan-quota). The `/login` file is not read and `/api/oauth/usage` is not called. Without an env token at startup, this mode also stays passive.
+**Probe mode (`claudeProbe: true` or `OPENCODE_USAGE_CLAUDE_PROBE=1`), when no usable `/login` file exists at startup (a usable login takes precedence):** only `$CLAUDE_CODE_OAUTH_TOKEN` is used by the probe provider, as described in [Claude inference probe](#claude-inference-probe-opt-in-consumes-plan-quota). Startup checks the login file, but probes do not use it or call `/api/oauth/usage`. Without an env token at startup, this mode also stays passive.
 
 **Fallback in both modes:**
 - **Passive fallback:** with no polled credential (and no active probe), it reads public `session.step.started` / `ended` / `failed` events, correlates the `claude-agent` provider, and retains only sanitized `native.rateLimit` (older hosts: `providerState.rateLimit`). No CLI process or transcript read is added; the only inference probe is the opt-in above.
@@ -139,6 +148,18 @@ Anthropic API keys and Bedrock/Vertex/Foundry credentials are not used for subsc
         { "name": "monthly", "usedPercent": 8, "state": "ok", "resetsAt": "2026-10-26T14:00:00.000Z" }
       ],
       "availability": "available",
+      "nextAvailableAt": null
+    },
+    "zen": {
+      "authenticated": true,
+      "checkedAt": "2026-09-26T14:00:00.000Z",
+      "stale": false,
+      "error": null,
+      "windows": [
+        { "name": "credits_balance", "balanceUSD": 12.34, "currency": "USD", "usedPercent": null, "state": "ok", "resetsAt": null }
+      ],
+      "availability": "available",
+      "plan": null,
       "nextAvailableAt": null
     },
     "codex": {

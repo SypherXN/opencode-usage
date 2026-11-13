@@ -81,6 +81,41 @@ function makeGoDb(dir: string, key: string): string {
   return file;
 }
 
+test("Zen Console OAuth balance reaches RPC and JSON file without Go subscription", async () => {
+  const restore = scrubEnv();
+  const dir = mkdtempSync(path.join(tmpdir(), "zen-integration-"));
+  const file = makeGoDb(dir, "fake-go");
+  const db = new DatabaseSync(file);
+  db.prepare("INSERT INTO credential VALUES (?, ?, ?, ?)").run("opencode", JSON.stringify({
+    type: "oauth", access: "fake-console-secret", expires: T0 + DAY,
+    metadata: { server: "https://opencode.ai/console", orgID: "wrk_Test" },
+  }), 1, 1);
+  db.close();
+  process.env.OPENCODE_DB = file;
+  process.env.OPENCODE_DATA = dir;
+  const host = makeHost(memStorage().storage, dir);
+  let billingCalls = 0;
+  let cleanup: (() => Promise<void>) | undefined;
+  try {
+    cleanup = await createRuntime(host.ctx, { now: () => T0, fetchImpl: (async (url) => {
+      if (String(url) === "https://opencode.ai/console/api/billing/status") {
+        billingCalls++;
+        return new Response('{"availableMicroCents":"1234000000"}');
+      }
+      return new Response("{}", { status: 404 });
+    }) as typeof fetch });
+    await settle();
+    const doc = STATUS_OUTPUT.parse(await rpcStatus(host));
+    assert.equal(doc.sources.zen.windows[0].balanceUSD, 12.34);
+    assert.equal(doc.sources.zen.availability, "available");
+    assert.equal(doc.sources.go.availability, "unknown");
+    const onDisk = JSON.parse(readFileSync(path.join(dir, "opencode-usage.json"), "utf8"));
+    assert.deepEqual(onDisk.sources.zen, doc.sources.zen);
+    assert.equal(billingCalls, 1);
+    assert.ok(!JSON.stringify(doc).includes("fake-console-secret"));
+  } finally { await cleanup?.(); restore(); }
+});
+
 // ---- environment scrub (never touch the real credential DB) -----------------
 
 const ENV_KEYS = [
@@ -291,7 +326,7 @@ describe("plugin wiring: startup", () => {
 
       await settle();
       const doc = await rpcStatus(host);
-      for (const id of ["go", "codex", "cursor", "claude-agent"] as const) {
+      for (const id of ["go", "codex", "cursor", "claude-agent", "zen"] as const) {
         assert.equal(doc.sources[id].authenticated, false);
         assert.equal(doc.sources[id].availability, "unknown");
         assert.deepEqual(doc.sources[id].windows, []);
@@ -715,6 +750,42 @@ describe("plugin wiring: Claude probe opt-in", () => {
         [["5h", 0, "ok"], ["7d", 6, "ok"]],
       );
       assert.equal(source.availability, "available");
+      await cleanup();
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("prefers a usable /login file over the opted-in env probe", async () => {
+    const restoreEnv = scrubEnv();
+    try {
+      const dir = freshTmp();
+      process.env.OPENCODE_DATA = path.join(dir, "empty-data");
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = "env-probe-token";
+      const claudeDir = mkdtempSync(path.join(tmpdir(), "gmua-claude-"));
+      process.env.CLAUDE_CONFIG_DIR = claudeDir;
+      writeFileSync(
+        path.join(claudeDir, ".credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: "file-token", expiresAt: T0 + DAY } }),
+      );
+      let runs = 0;
+      const f = makeFetch({ body: GO_OK_BODY }, { claudeUsage: { body: CLAUDE_USAGE_BODY } });
+      const { cleanup } = await boot(dir, {
+        fetchImpl: f.fetchImpl,
+        now: () => T0,
+        ttlMs: 30,
+        filePath: path.join(dir, "usage.json"),
+        claudeProbe: true,
+        claudeStateFile: path.join(dir, "claude-usage-gate.json"),
+        claudeProbeStateFile: path.join(dir, "probe-gate.json"),
+        claudeProbeRunner: async () => { runs++; return { windows: CLAUDE_CLI_WINDOWS }; },
+      });
+
+      await settle();
+      assert.equal(runs, 0, "no inference probe while a usable login exists");
+      const call = f.calls.find((c) => c.url === CLAUDE_USAGE_URL);
+      assert.ok(call, "the read-only usage endpoint is polled");
+      assert.equal((call.init?.headers as Record<string, string>).Authorization, "Bearer file-token");
       await cleanup();
     } finally {
       restoreEnv();

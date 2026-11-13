@@ -28,6 +28,7 @@ interface UsageWindowBase extends Record<string, JsonValue> {
 
 export type UsageWindow =
   | UsageWindowBase
+  | (UsageWindowBase & { /** Remaining prepaid credit, not a usage percentage. */ balanceUSD: number; currency: "USD" })
   | (UsageWindowBase & { /** UTC day-of-month inferred from a usage drop to zero. */ resetDay: number })
   | (UsageWindowBase & { /** True when resetsAt is estimated rather than provider-reported. */ resetEstimated: true })
   | (UsageWindowBase & {
@@ -98,6 +99,7 @@ export interface StatusSnapshot extends Record<string, JsonValue> {
   updatedAt: string;
   sources: {
     go: StatusSnapshotSource;
+    zen: StatusSnapshotSource;
     codex: StatusSnapshotSource;
     cursor: StatusSnapshotSource;
     "claude-agent": StatusSnapshotSource;
@@ -110,7 +112,7 @@ export interface StatusSnapshot extends Record<string, JsonValue> {
 
 /** A provider adapter normalizes raw endpoint data into a SourceStatus. */
 export interface QuotaSource {
-  id: "go" | "codex" | "cursor" | "claude-agent";
+  id: "go" | "zen" | "codex" | "cursor" | "claude-agent";
   /** Fetch and normalize. Must not throw on auth/network errors — return an unknown SourceStatus instead. */
   fetch(): Promise<SourceStatus>;
 }

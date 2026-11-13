@@ -29,6 +29,9 @@ export interface OAuthCredential {
   expires?: number | null;
   /** Optional account ID from metadata.accountID. */
   accountId?: string | null;
+  /** Console OAuth workspace metadata; never included in status output. */
+  server?: string;
+  orgID?: string;
 }
 
 export type Credential = KeyCredential | OAuthCredential;
@@ -77,6 +80,14 @@ export function parseCredentialValue(raw: unknown): Credential | null {
     if (typeof v.refresh === "string" && v.refresh.length > 0) cred.refresh = v.refresh;
     if (typeof v.expires === "number") cred.expires = v.expires;
     else if (typeof v.expires === "string" && /^\d+$/.test(v.expires)) cred.expires = Number(v.expires);
+    const metadata = (raw as { metadata?: Record<string, unknown> }).metadata;
+    const legacy = raw as { server?: unknown; orgID?: unknown };
+    const server = metadata?.server ?? legacy.server;
+    const orgID = metadata?.orgID ?? legacy.orgID;
+    if (typeof server === "string") cred.server = server;
+    if (typeof orgID === "string") cred.orgID = orgID;
+    // Preserve invalid reported expiry as invalid, rather than silently treating it as absent.
+    if ("expires" in v && v.expires != null && cred.expires === undefined) cred.expires = NaN;
     const id = v.metadata?.accountID;
     if (typeof id === "string" && id.length > 0) cred.accountId = id;
     return cred;
@@ -153,6 +164,15 @@ export function loadCredentials(opts?: { overrides?: Overrides }): Map<string, C
 export function resolveGoKey(found: Map<string, Credential>): string | null {
   const c = found.get("opencode-go");
   return c && c.kind === "key" ? c.key : null;
+}
+
+/** Only a Console OAuth sign-in can read prepaid credits; API keys cannot. */
+export function resolveZen(found: Map<string, Credential>, now = Date.now()): { access: string; orgID: string } | null {
+  const c = found.get("opencode");
+  if (!c || c.kind !== "oauth" || !c.access.trim() || c.server !== "https://opencode.ai/console" ||
+      !c.orgID || !/^(?:org|wrk)_[A-Za-z0-9]+$/.test(c.orgID)) return null;
+  if (c.expires != null && (!Number.isFinite(c.expires) || c.expires < 0 || (c.expires > 0 && c.expires <= now))) return null;
+  return { access: c.access, orgID: c.orgID };
 }
 
 /** Resolve the Codex/ChatGPT OAuth access token + optional account ID. */

@@ -18,11 +18,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Plugin } from "@opencode/plugin";
 import { GoAttribution, type DenialErrorLike } from "./attribution.ts";
-import { loadCredentials, resolveCodex, resolveGoKey } from "./auth.ts";
+import { loadCredentials, resolveCodex, resolveGoKey, resolveZen } from "./auth.ts";
 import { resolveCursorFull, saveManagedToken } from "./cursor-auth.ts";
 import { StatusFilePublisher } from "./file.ts";
 import { codexProvider } from "./providers/codex.ts";
 import { goProvider } from "./providers/go.ts";
+import { zenProvider } from "./providers/zen.ts";
 import { cursorProvider } from "./providers/cursor.ts";
 import { ClaudeAgentObserver } from "./providers/claude-agent.ts";
 import { CLAUDE_POLL_MS, claudeProvider } from "./providers/claude.ts";
@@ -113,7 +114,7 @@ export function initialSnapshot(now: Date = new Date()): StatusSnapshot {
   return {
     schemaVersion: SCHEMA_VERSION,
     updatedAt: now.toISOString(),
-    sources: { go: unknownSource, codex: unknownSource, cursor: unknownSource, "claude-agent": unknownSource },
+    sources: { go: unknownSource, zen: unknownSource, codex: unknownSource, cursor: unknownSource, "claude-agent": unknownSource },
     models: { go: {} },
   };
 }
@@ -131,9 +132,11 @@ export async function createRuntime(
   const ttlMs = deps.ttlMs ?? POLL_CACHE_MS;
   const storage = ctx.storage;
   const claudeProbe = deps.claudeProbe === true || process.env.OPENCODE_USAGE_CLAUDE_PROBE === "1";
-  // Probe mode is env-only and must not touch the /login credential file.
+  // Check for a usable /login file at startup; otherwise the opted-in probe
+  // provider uses only the env token, not the /login credential.
+  const claudeLoginUsable = resolveClaudeAuths(now()).some((a) => a.source === "file");
   const claudeProbeToken = claudeProbe ? process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() : undefined;
-  const claudeProbeActive = claudeProbe && !!claudeProbeToken;
+  const claudeProbeActive = claudeProbe && !claudeLoginUsable && !!claudeProbeToken;
 
   // Credentials (read-only; values never leave these closures).
   const found = loadCredentials();
@@ -143,6 +146,7 @@ export async function createRuntime(
 
   // Providers: never throw; a missing credential means "credential not found", no request.
   const providers = {
+    zen: zenProvider({ resolveCredential: () => resolveZen(loadCredentials(), now()), fetchImpl, now }),
     go: goProvider({
       apiKey: goKey,
       // Rejected key only: re-read the credential DB in case it rotated.
@@ -170,36 +174,37 @@ export async function createRuntime(
     // validated quota events. Otherwise the read-only usage endpoint requires
     // `user:profile`, so only the /login token is polled and the env setup-token
     // can never be sent there.
-    ...(claudeProbe
-      ? (claudeProbeToken
-          ? {
-              "claude-agent": claudeProvider({
-                probe: true,
-                resolveAuths: () => {
-                  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
-                  return token ? [{ token, source: "env" as const }] : [];
-                },
-                fetchImpl,
-                now,
-                runProbe: deps.claudeProbeRunner,
-                probeStateFile:
-                  deps.claudeProbeStateFile ??
-                  path.join(tmpdir(), "opencode-usage-claude-probe-gate.json"),
-              }),
-            }
-          : {})
-      : (resolveClaudeAuths(now()).some((a) => a.source === "file")
-          ? {
-              "claude-agent": claudeProvider({
-                resolveAuths: () => resolveClaudeAuths(now()).filter((a) => a.source === "file"),
-                fetchImpl,
-                now,
-                stateFile:
-                  deps.claudeStateFile ??
-                  path.join(tmpdir(), "opencode-usage-claude-gate.json"),
-              }),
-            }
-          : {})),
+    // Selection is login-first at startup: a usable (unexpired) /login file wins
+    // even when the probe is opted in. The opted-in env probe is only the
+    // fallback when no usable login exists; API errors never switch modes.
+    ...(claudeLoginUsable
+      ? {
+          "claude-agent": claudeProvider({
+            resolveAuths: () => resolveClaudeAuths(now()).filter((a) => a.source === "file"),
+            fetchImpl,
+            now,
+            stateFile:
+              deps.claudeStateFile ??
+              path.join(tmpdir(), "opencode-usage-claude-gate.json"),
+          }),
+        }
+      : claudeProbeActive
+        ? {
+            "claude-agent": claudeProvider({
+              probe: true,
+              resolveAuths: () => {
+                const token = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
+                return token ? [{ token, source: "env" as const }] : [];
+              },
+              fetchImpl,
+              now,
+              runProbe: deps.claudeProbeRunner,
+              probeStateFile:
+                deps.claudeProbeStateFile ??
+                path.join(tmpdir(), "opencode-usage-claude-probe-gate.json"),
+            }),
+          }
+        : {}),
   };
 
   // Engine (single owner of polling) + Go attribution (estimates only).

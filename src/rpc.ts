@@ -16,7 +16,7 @@ import type { SourceId } from "./status.ts";
 import { POLL_CACHE_MS, SCHEMA_VERSION, type SourceStatus, type StatusSnapshot } from "./types.ts";
 
 /** All source ids, for a manual all-source refresh. */
-export const ALL_SOURCES: SourceId[] = ["go", "codex", "cursor", "claude-agent"];
+export const ALL_SOURCES: SourceId[] = ["go", "codex", "cursor", "claude-agent", "zen"];
 
 const availability = z.enum(["available", "limited", "unknown"]);
 const windowState = z.enum(["ok", "rate-limited", "unknown"]);
@@ -36,6 +36,8 @@ const windowSchema = z.object({
   resetsAt: z.string().nullable(),
   resetDay: z.number().int().min(1).max(31).optional(),
   resetEstimated: z.boolean().optional(),
+  balanceUSD: z.number().finite().nonnegative().optional(),
+  currency: z.literal("USD").optional(),
 });
 
 const sourceSchema = z.object({
@@ -64,7 +66,7 @@ const estimateSchema = z
 export const STATUS_OUTPUT = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
   updatedAt: z.string(),
-  sources: z.object({ go: sourceSchema, codex: sourceSchema, cursor: sourceSchema, "claude-agent": sourceSchema }),
+  sources: z.object({ go: sourceSchema, zen: sourceSchema, codex: sourceSchema, cursor: sourceSchema, "claude-agent": sourceSchema }),
   models: z.object({ go: z.record(z.string(), estimateSchema) }),
 });
 

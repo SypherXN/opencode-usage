@@ -35,7 +35,7 @@ function doc(tag: string): StatusSnapshot {
     schemaVersion: SCHEMA_VERSION,
     updatedAt: new Date(T0).toISOString(),
     tag,
-    sources: { go: source(), codex: source(), cursor: source(), "claude-agent": source() },
+    sources: { go: source(), zen: source(), codex: source(), cursor: source(), "claude-agent": source() },
     models: { go: {} },
   };
 }
